@@ -3,7 +3,6 @@
 
 import os, re, io, json, threading, webbrowser, email, uuid, shutil, tempfile, traceback
 from http.server import HTTPServer, BaseHTTPRequestHandler
-import cgi
 from datetime import datetime
 import pandas as pd
 import pdfplumber
