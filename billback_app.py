@@ -1362,8 +1362,27 @@ HTML_PAGE = r"""<!DOCTYPE html>
 </head>
 <body>
 <div class="header">
-  <svg width="36" height="36" viewBox="0 0 36 36" fill="none"><circle cx="18" cy="18" r="18" fill="white" fill-opacity=".15"/><text x="18" y="23" text-anchor="middle" font-size="18" fill="white">📊</text></svg>
-  <div><h1>Monin Billback Processor</h1><div class="sub">Automatically extract &amp; format supplier billback data for Tellus upload</div></div>
+  <!-- Monin Logo SVG -->
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 220 80" height="56" style="flex-shrink:0">
+    <defs>
+      <!-- Teardrop clip path for the colorful drop above the i -->
+      <clipPath id="dropClip">
+        <path d="M128 4 C118 4 108 12 108 24 C108 36 118 46 128 50 C138 46 148 36 148 24 C148 12 138 4 128 4 Z"/>
+      </clipPath>
+    </defs>
+    <!-- Colored stripes clipped to teardrop shape -->
+    <rect x="108" y="4" width="8"  height="46" fill="#7B2589" clip-path="url(#dropClip)"/>
+    <rect x="116" y="4" width="7"  height="46" fill="#C42B72" clip-path="url(#dropClip)"/>
+    <rect x="123" y="4" width="6"  height="46" fill="#E8604A" clip-path="url(#dropClip)"/>
+    <rect x="129" y="4" width="7"  height="46" fill="#F08C20" clip-path="url(#dropClip)"/>
+    <rect x="136" y="4" width="12" height="46" fill="#F5B800" clip-path="url(#dropClip)"/>
+    <!-- MONIN text -->
+    <text x="4" y="76" font-family="'Palatino Linotype','Palatino','Book Antiqua',Georgia,serif"
+          font-size="54" font-weight="700" fill="#ffffff" letter-spacing="2">MONIN</text>
+    <!-- ® symbol -->
+    <text x="196" y="52" font-family="serif" font-size="16" fill="#ffffff">®</text>
+  </svg>
+  <div><div class="sub" style="color:rgba(255,255,255,.8);font-size:.9rem;margin-top:4px">Supplier Billback Processor — Tellus Upload</div></div>
 </div>
 
 <div class="container">
@@ -1928,7 +1947,17 @@ LOGIN_PAGE = """<!DOCTYPE html>
   .err{color:#dc2626;font-size:.85rem;margin-bottom:12px}
 </style></head>
 <body><div class="card">
-  <h2>Monin Billback</h2>
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 220 80" height="48" style="margin-bottom:8px">
+    <defs><clipPath id="dc"><path d="M128 4 C118 4 108 12 108 24 C108 36 118 46 128 50 C138 46 148 36 148 24 C148 12 138 4 128 4 Z"/></clipPath></defs>
+    <rect x="108" y="4" width="8"  height="46" fill="#7B2589" clip-path="url(#dc)"/>
+    <rect x="116" y="4" width="7"  height="46" fill="#C42B72" clip-path="url(#dc)"/>
+    <rect x="123" y="4" width="6"  height="46" fill="#E8604A" clip-path="url(#dc)"/>
+    <rect x="129" y="4" width="7"  height="46" fill="#F08C20" clip-path="url(#dc)"/>
+    <rect x="136" y="4" width="12" height="46" fill="#F5B800" clip-path="url(#dc)"/>
+    <text x="4" y="76" font-family="'Palatino Linotype','Palatino','Book Antiqua',Georgia,serif" font-size="54" font-weight="700" fill="#4A2810" letter-spacing="2">MONIN</text>
+    <text x="196" y="52" font-family="serif" font-size="16" fill="#4A2810">®</text>
+  </svg>
+  <h2>Billback Processor</h2>
   <p>Enter the team password to continue.</p>
   {error}
   <form method="post" action="/login">
