@@ -1362,27 +1362,25 @@ HTML_PAGE = r"""<!DOCTYPE html>
 </head>
 <body>
 <div class="header">
-  <!-- Monin Logo SVG -->
-  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 220 80" height="56" style="flex-shrink:0">
-    <defs>
-      <!-- Teardrop clip path for the colorful drop above the i -->
-      <clipPath id="dropClip">
-        <path d="M128 4 C118 4 108 12 108 24 C108 36 118 46 128 50 C138 46 148 36 148 24 C148 12 138 4 128 4 Z"/>
-      </clipPath>
-    </defs>
-    <!-- Colored stripes clipped to teardrop shape -->
-    <rect x="108" y="4" width="8"  height="46" fill="#7B2589" clip-path="url(#dropClip)"/>
-    <rect x="116" y="4" width="7"  height="46" fill="#C42B72" clip-path="url(#dropClip)"/>
-    <rect x="123" y="4" width="6"  height="46" fill="#E8604A" clip-path="url(#dropClip)"/>
-    <rect x="129" y="4" width="7"  height="46" fill="#F08C20" clip-path="url(#dropClip)"/>
-    <rect x="136" y="4" width="12" height="46" fill="#F5B800" clip-path="url(#dropClip)"/>
+  <!-- Monin Logo: drop icon + text side by side -->
+  <div style="display:flex;align-items:flex-end;gap:0;flex-shrink:0;line-height:1">
+    <!-- Colorful teardrop icon as standalone SVG -->
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 52" width="28" height="36" style="margin-right:6px;margin-bottom:4px">
+      <defs>
+        <mask id="dm">
+          <path fill="white" d="M20,50 C6,40 0,28 0,17 C0,7 9,0 20,0 C31,0 40,7 40,17 C40,28 34,40 20,50 Z"/>
+        </mask>
+      </defs>
+      <rect x="0"  y="0" width="8"  height="52" fill="#7B2589" mask="url(#dm)"/>
+      <rect x="8"  y="0" width="7"  height="52" fill="#C42B72" mask="url(#dm)"/>
+      <rect x="15" y="0" width="7"  height="52" fill="#E8604A" mask="url(#dm)"/>
+      <rect x="22" y="0" width="8"  height="52" fill="#F08C20" mask="url(#dm)"/>
+      <rect x="30" y="0" width="10" height="52" fill="#F5B800" mask="url(#dm)"/>
+    </svg>
     <!-- MONIN text -->
-    <text x="4" y="76" font-family="'Palatino Linotype','Palatino','Book Antiqua',Georgia,serif"
-          font-size="54" font-weight="700" fill="#ffffff" letter-spacing="2">MONIN</text>
-    <!-- ® symbol -->
-    <text x="196" y="52" font-family="serif" font-size="16" fill="#ffffff">®</text>
-  </svg>
-  <div><div class="sub" style="color:rgba(255,255,255,.8);font-size:.9rem;margin-top:4px">Supplier Billback Processor — Tellus Upload</div></div>
+    <span style="font-family:Georgia,'Times New Roman',serif;font-size:2.2rem;font-weight:700;color:#ffffff;letter-spacing:3px">MONIN<sup style="font-size:.75rem;letter-spacing:0;vertical-align:super">&#174;</sup></span>
+  </div>
+  <div class="sub" style="color:rgba(255,255,255,.75);font-size:.88rem;margin-left:14px">Supplier Billback Processor</div>
 </div>
 
 <div class="container">
@@ -1947,15 +1945,19 @@ LOGIN_PAGE = """<!DOCTYPE html>
   .err{color:#dc2626;font-size:.85rem;margin-bottom:12px}
 </style></head>
 <body><div class="card">
-  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 220 80" height="48" style="margin-bottom:8px">
-    <defs><clipPath id="dc"><path d="M128 4 C118 4 108 12 108 24 C108 36 118 46 128 50 C138 46 148 36 148 24 C148 12 138 4 128 4 Z"/></clipPath></defs>
-    <rect x="108" y="4" width="8"  height="46" fill="#7B2589" clip-path="url(#dc)"/>
-    <rect x="116" y="4" width="7"  height="46" fill="#C42B72" clip-path="url(#dc)"/>
-    <rect x="123" y="4" width="6"  height="46" fill="#E8604A" clip-path="url(#dc)"/>
-    <rect x="129" y="4" width="7"  height="46" fill="#F08C20" clip-path="url(#dc)"/>
-    <rect x="136" y="4" width="12" height="46" fill="#F5B800" clip-path="url(#dc)"/>
-    <text x="4" y="76" font-family="'Palatino Linotype','Palatino','Book Antiqua',Georgia,serif" font-size="54" font-weight="700" fill="#4A2810" letter-spacing="2">MONIN</text>
-    <text x="196" y="52" font-family="serif" font-size="16" fill="#4A2810">®</text>
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 210 75" height="56" style="margin-bottom:8px">
+    <defs>
+      <mask id="lm">
+        <path fill="white" d="M133,50 C118,42 111,30 111,19 C111,9 121,2 133,2 C145,2 155,9 155,19 C155,30 148,42 133,50 Z"/>
+      </mask>
+    </defs>
+    <rect x="111" y="2" width="9"  height="50" fill="#7B2589" mask="url(#lm)"/>
+    <rect x="120" y="2" width="8"  height="50" fill="#C42B72" mask="url(#lm)"/>
+    <rect x="128" y="2" width="8"  height="50" fill="#E8604A" mask="url(#lm)"/>
+    <rect x="136" y="2" width="9"  height="50" fill="#F08C20" mask="url(#lm)"/>
+    <rect x="145" y="2" width="12" height="50" fill="#F5B800" mask="url(#lm)"/>
+    <text x="2" y="73" font-family="Georgia,'Times New Roman',serif" font-size="52" font-weight="700" fill="#4A2810" letter-spacing="4">MONIN</text>
+    <text x="188" y="48" font-family="serif" font-size="14" fill="#4A2810">&#174;</text>
   </svg>
   <h2>Billback Processor</h2>
   <p>Enter the team password to continue.</p>
