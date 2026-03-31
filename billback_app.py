@@ -1998,7 +1998,7 @@ def parse_mclane(filepath, cfg, customer_ref):
         rows.append({'_error': str(e)})
     return rows
 
-def parse_sw_pdf(filepath, cfg, customer_ref):
+def parse_sw_pdf(filepath, cfg, customer_ref, source_override=''):
     """S&W Wholesale Foods Trackmax PDF format.
     Columns: Inv.Number Inv.Date CustomerID CustomerName Brand PackSize Description
              ProductID(6-digit) DID(####CS) UPC Quantity TotalWeight ProgramAmount AmountDue
@@ -2022,23 +2022,27 @@ def parse_sw_pdf(filepath, cfg, customer_ref):
         if m: inv_num = m.group(1).strip()
         cref = customer_ref or inv_num
 
-        # Source name from IMPORTANT! header
-        source_name = 'S&W'
-        m2 = re.search(r'IMPORTANT!\s*\n([^\n]+)', all_text)
-        if m2: source_name = m2.group(1).strip()
+        # Source name: use user-selected distributor if provided, else auto-detect from IMPORTANT! header
+        if source_override:
+            source_name = source_override
+        else:
+            source_name = 'S&W'
+            m2 = re.search(r'IMPORTANT!\s*\n([^\n]+)', all_text)
+            if m2: source_name = m2.group(1).strip()
 
         # Line pattern: also capture PackSize (before product ID) for item lookup
         # Format: ... MONIN <PackSize> <Description> <ProductID> <DID>CS <UPC> <Qty> <Wt> BB To .../unit $<Amt>
         line_pat = re.compile(
-            r'MONIN\s+([\d/]+\s*(?:LT|ML|L)?)\s+'  # PackSize after MONIN
-            r'(?:\w+\s+)*?'                          # Description words (non-greedy)
-            r'([A-Z]-[A-Z0-9]+|\d{6})\s+'           # Product ID: M-code or 6-digit number
-            r'\d{4,6}(?:CS)?\s+'                     # DID (ignore, CS suffix optional)
-            r'\d{10,14}\s+'                          # UPC (ignore)
-            r'(\d+\.?\d*)\s+'                        # Quantity
-            r'[\d.]+\s+'                             # Total Weight (ignore)
-            r'BB\s+To\s+[\d.]+/unit\s+'              # Program Amount (ignore)
-            r'\$([\d,.]+)',                           # Amount Due
+            r'MONIN\s+([\d/.]+(?:\s+\d+)?(?:\s*(?:LT|ML|L|OZ))?)\s+'  # PackSize: "4/1 LT","12/750","4 1 LT","4/33.8 OZ"
+            r'(?:\S+\s+)*?'                            # Description words (non-greedy, allows commas)
+            r'([A-Z]-[A-Z0-9]+|\d{6})\s+'             # Product ID: M-code or 6-digit number
+            r'\d{4,6}(?:CS)?\s+'                       # DID (ignore, CS suffix optional)
+            r'(?:\d{10,16}\s+)?'                       # UPC (optional, up to 16 digits)
+            r'(\d+\.?\d*)\s+'                          # Quantity
+            r'[\d,.]+\s+'                              # Total Weight (ignore, may have comma)
+            r'(?:\$[\d,.]+\s+)?'                       # Total Charges (optional — Y.Hata has it, S&W doesn't)
+            r'BB\s+To\s+[\d.]+/unit\s+'               # Program Amount (ignore)
+            r'\$([\d,.]+)',                             # Amount Due
             re.I
         )
 
@@ -2986,15 +2990,19 @@ def detect_and_parse(filepath, user_config=None, customer_ref='', file_override=
     # Capture operator override settings to apply after parsing
     _operator_override = cfg.get('operator_id', '') if cfg.get('trade') == 'O' else ''
 
+    # If user explicitly selected a distributor, use that name as the Source label
+    _source_override = (file_override or {}).get('supplier', '').strip()
+
     def _apply_type_override(rows):
-        """After parsing, patch trade indicator and operator ID if row_type=Operator."""
-        if not _operator_override:
-            return rows
+        """After parsing, patch trade indicator, operator ID, and source name."""
         for row in rows:
             if '_error' in row: continue
-            row['Trade Indicator'] = 'O'
-            row['Operator ID']     = _operator_override
-            row['Program #']       = ' '
+            if _source_override:
+                row['Source'] = _source_override
+            if _operator_override:
+                row['Trade Indicator'] = 'O'
+                row['Operator ID']     = _operator_override
+                row['Program #']       = ' '
         return rows
 
     def _ret(sup, rows):
