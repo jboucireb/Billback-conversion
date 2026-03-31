@@ -2990,8 +2990,9 @@ def detect_and_parse(filepath, user_config=None, customer_ref='', file_override=
     # Capture operator override settings to apply after parsing
     _operator_override = cfg.get('operator_id', '') if cfg.get('trade') == 'O' else ''
 
-    # If user explicitly selected a distributor, use that display name as the Source label
-    _source_override = (file_override or {}).get('supplier_display', '').strip()
+    # Only override Source when user manually picked a distributor from the dropdown
+    _user_selected   = (file_override or {}).get('supplier_user_selected', False)
+    _source_override = (file_override or {}).get('supplier_display', '').strip() if _user_selected else ''
 
     def _apply_type_override(rows):
         """After parsing, patch trade indicator, operator ID, and source name."""
@@ -3471,7 +3472,9 @@ function filterDist(idx) {
 function selectDist(idx, name) {
   const key  = distNameToKey(name);
   document.getElementById('supplier_text_'+idx).value = name;
-  document.getElementById('supplier_'+idx).value = key;
+  const hiddenEl = document.getElementById('supplier_'+idx);
+  hiddenEl.value = key;
+  hiddenEl.dataset.userSelected = 'true';
   const inp  = document.getElementById('supplier_text_'+idx);
   inp.className = 'combo-input';
   hideDist(idx);
@@ -3628,9 +3631,11 @@ async function processFiles() {
     const rowType    = document.getElementById(`type_${i}`)?.value || 'Program';
     const opName     = document.getElementById(`opname_${i}`)?.value.trim() || '';
     const progVal    = rowType === 'Operator' ? '' : (document.getElementById(`prog_${i}`)?.value.trim() || '');
+    const supplierEl = document.getElementById(`supplier_${i}`);
     fileOverrides[f.name] = {
-      supplier:          document.getElementById(`supplier_${i}`)?.value || '',
-      supplier_display:  document.getElementById(`supplier_text_${i}`)?.value.trim() || '',
+      supplier:               supplierEl?.value || '',
+      supplier_display:       document.getElementById(`supplier_text_${i}`)?.value.trim() || '',
+      supplier_user_selected: supplierEl?.dataset.userSelected === 'true',
       program_num:       progVal,
       dist_id:           document.getElementById(`dist_${i}`)?.value.trim() || '',
       customer_ref:      document.getElementById(`cref_${i}`)?.value.trim() || '',
