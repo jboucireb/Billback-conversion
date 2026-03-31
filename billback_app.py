@@ -1807,6 +1807,9 @@ def detect_supplier(filename):
 # ─── PARSERS ─────────────────────────────────────────────────────────────────
 
 def parse_bek_or_nich(filepath, source_name, cfg, customer_ref):
+    # PDFs use Trackmax format — route through content-based detector
+    if filepath.lower().endswith('.pdf'):
+        return parse_supplier_billback_pdf(filepath, cfg, customer_ref)
     rows = []
     try:
         df = pd.read_csv(filepath, sep='\t', dtype=str, low_memory=False)
@@ -2559,9 +2562,9 @@ def parse_trackmax(filepath, cfg, customer_ref, source_name=''):
         #   Credit:   X97707 02/20/2026 ... M-FR035F 350377 10738337884136 (1.00) (11.53) ($31.44) BB To 22.400/unit ($9.04)
         # Also handles truncated UPC (10-11 chars) when pdfplumber wraps the line.
         line_pat = re.compile(
-            r'([A-Z]-[A-Z0-9]+)\s+\d{4,9}\s+\d{8,14}\s+'   # M-code, DID (4-9d), UPC (8-14d)
+            r'([A-Z]-[A-Z0-9]+)\s+\d{4,9}\s+(?:\d{8,14}\s+)?'  # M-code, DID (4-9d), UPC optional (8-14d)
             r'(\([\d.]+\)|[\d.]+)\s+'                    # qty: positive or (negative)
-            r'[\d.()]+\s+'                               # weight (ignore)
+            r'[\d,.()]+\s+'                              # weight (ignore, may have comma e.g. 1,268.40)
             r'(?:\(\$[\d,.]+\)|\$[-\d,.]+)\s+'          # Total Charges (ignore, may be negative $-X.XX)
             r'\S.*?'                                     # Program Amount text
             r'(\(\$[\d,.]+\)|\$[-\d,.]+)',               # Amount Due (last $ value)
@@ -2790,20 +2793,13 @@ def parse_supplier_billback_pdf(filepath, cfg, customer_ref):
     # (only one $ amount per line — Amount Due only)
     # Check for "BB To" pattern without a preceding $XX Total Charges
     if ('Product ID' in first_page and 'DID' in first_page and 'UPC' in first_page):
-        # Peek at content to choose the right Trackmax variant
-        try:
-            with pdfplumber.open(filepath) as _pdf:
-                _sample = _pdf.pages[0].extract_text() or ''
-            # If lines have "$X.XX BB To" (Total Charges before BB To) → standard Trackmax
-            # If lines have just "BB To ... $X.XX" at end → sw_pdf variant
-            import re as _re
-            _has_total_charges = bool(_re.search(r'\$[\d,.]+\s+BB\s+To', _sample, _re.I))
-        except Exception:
-            _has_total_charges = False
-        if _has_total_charges:
-            return parse_trackmax(filepath, cfg, customer_ref)
-        else:
+        # Choose Trackmax variant by program amount format:
+        #   "BB To X.000/unit $Y"  → S&W/SGC style (parse_sw_pdf)
+        #   "X.00 % of Del $Y"     → BEK/Driscoll style (parse_trackmax)
+        if re.search(r'BB\s+To\s+[\d.]+/unit', first_page, re.I):
             return parse_sw_pdf(filepath, cfg, customer_ref)
+        else:
+            return parse_trackmax(filepath, cfg, customer_ref)
     if 'Powered byTrackmax' in first_page:
         return parse_trackmax(filepath, cfg, customer_ref)
     if 'BB Dept' in first_page and 'BB Vendor' in first_page:
