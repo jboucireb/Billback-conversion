@@ -1744,7 +1744,7 @@ def clean_amount(val):
 # ─── TELLUS ROW BUILDER (returns dict keyed by S1_COLS) ──────────────────────
 def make_row(source='', program_num='', customer_ref='', dist_id='',
              bill_date='', start_date='', end_date='',
-             item='', qty=0, amount=0.0, trade='D'):
+             item='', qty=0, amount=0.0, trade='D', operator_id=''):
     try:
         dist_id_int = int(str(dist_id).strip()) if str(dist_id).strip() else None
     except:
@@ -1764,7 +1764,7 @@ def make_row(source='', program_num='', customer_ref='', dist_id='',
         'Customer Reference':      str(customer_ref),
         'Payee Type':              'D',
         'Distributor ID':          dist_id_int,
-        'Operator ID':             ' ',
+        'Operator ID':             str(operator_id) if operator_id else ' ',
         'Closing Method':          'D',
         'Billback Date':           str(bill_date) if bill_date else TODAY,
         'BB Start Date':           str(start_date),
@@ -2968,7 +2968,14 @@ def detect_and_parse(filepath, user_config=None, customer_ref='', file_override=
         if uc.get('item_map'):    cfg['item_map']    = uc['item_map']  # {harbor_code: m_code}
     # Per-file overrides take highest priority (entered by user in the file row)
     if file_override:
-        if file_override.get('program_num'): cfg['program_num'] = file_override['program_num']
+        row_type = file_override.get('row_type', 'Program')
+        if row_type == 'Operator':
+            cfg['program_num']  = ''          # Operator rows have no Program #
+            cfg['trade']        = 'O'
+            cfg['operator_id']  = file_override.get('operator_name', '')
+        else:
+            if file_override.get('program_num'): cfg['program_num'] = file_override['program_num']
+            cfg['trade'] = 'D'
         if file_override.get('dist_id'):     cfg['dist_id']     = file_override['dist_id']
         if file_override.get('customer_ref') and not customer_ref:
             customer_ref = file_override['customer_ref']
@@ -2976,48 +2983,65 @@ def detect_and_parse(filepath, user_config=None, customer_ref='', file_override=
     fn = os.path.basename(filepath).upper()
     ext = os.path.splitext(filepath)[1].lower()
 
+    # Capture operator override settings to apply after parsing
+    _operator_override = cfg.get('operator_id', '') if cfg.get('trade') == 'O' else ''
+
+    def _apply_type_override(rows):
+        """After parsing, patch trade indicator and operator ID if row_type=Operator."""
+        if not _operator_override:
+            return rows
+        for row in rows:
+            if '_error' in row: continue
+            row['Trade Indicator'] = 'O'
+            row['Operator ID']     = _operator_override
+            row['Program #']       = ' '
+        return rows
+
+    def _ret(sup, rows):
+        return sup, _apply_type_override(rows)
+
     if supplier == 'BEK':
-        return supplier, parse_bek_or_nich(filepath, 'BEK', cfg, customer_ref)
+        return _ret(supplier, parse_bek_or_nich(filepath, 'BEK', cfg, customer_ref))
     elif supplier == 'NICH_CO':
-        return supplier, parse_bek_or_nich(filepath, 'Nich&Co', cfg, customer_ref)
+        return _ret(supplier, parse_bek_or_nich(filepath, 'Nich&Co', cfg, customer_ref))
     elif supplier == 'SHAMROCK':
-        return supplier, parse_shamrock(filepath, cfg, customer_ref)
+        return _ret(supplier, parse_shamrock(filepath, cfg, customer_ref))
     elif supplier == 'DOT_CBBB':
-        return supplier, parse_dot_cbbb(filepath, cfg, customer_ref)
+        return _ret(supplier, parse_dot_cbbb(filepath, cfg, customer_ref))
     elif supplier in ('MCLANE','MCLANE_OR_DOT'):
-        return supplier, parse_mclane(filepath, cfg, customer_ref)
+        return _ret(supplier, parse_mclane(filepath, cfg, customer_ref))
     elif supplier == 'S_AND_W':
-        return supplier, parse_sw(filepath, cfg, customer_ref)
+        return _ret(supplier, parse_sw(filepath, cfg, customer_ref))
     elif supplier == 'KAST':
-        return supplier, parse_kast(filepath, cfg, customer_ref)
+        return _ret(supplier, parse_kast(filepath, cfg, customer_ref))
     elif supplier == 'SOFO':
-        return supplier, parse_sofo(filepath, cfg, customer_ref)
+        return _ret(supplier, parse_sofo(filepath, cfg, customer_ref))
     elif supplier == 'PFS' or supplier == 'PFS_STYLE':
-        return supplier, parse_pfs(filepath, cfg, customer_ref)
+        return _ret(supplier, parse_pfs(filepath, cfg, customer_ref))
     elif supplier == 'Y_HATA':
-        return supplier, parse_yhata(filepath, cfg, customer_ref)
+        return _ret(supplier, parse_yhata(filepath, cfg, customer_ref))
     elif supplier == 'LABATT':
-        return supplier, parse_labatt(filepath, cfg, customer_ref)
+        return _ret(supplier, parse_labatt(filepath, cfg, customer_ref))
     elif supplier == 'HARBOR':
         result = parse_harbor(filepath, cfg, customer_ref)
         # Content-based routing may have identified a different distributor — label accordingly
         if result and isinstance(result[0], dict):
             src = result[0].get('Source', '')
             if src == 'Martin Bros':
-                return 'MARTIN_BROS', result
+                return _ret('MARTIN_BROS', result)
             if src == 'Driscoll Foods':
-                return 'DRISCOLL', result
-        return supplier, result
+                return _ret('DRISCOLL', result)
+        return _ret(supplier, result)
     elif supplier == 'MARTIN_BROS':
-        return supplier, parse_martin_bros(filepath, cfg, customer_ref)
+        return _ret(supplier, parse_martin_bros(filepath, cfg, customer_ref))
     elif supplier == 'DRISCOLL':
-        return supplier, parse_driscoll(filepath, cfg, customer_ref)
+        return _ret(supplier, parse_driscoll(filepath, cfg, customer_ref))
     elif supplier == 'BLAIR_CANDY':
         return supplier, [{'_error': 'Blair Candy uses scanned/image PDFs — text extraction not supported. Please enter manually.'}]
     else:
         # Try content-based detection for PDFs (S&W, Martin Bros, Driscoll, Trackmax, etc.)
         if ext == '.pdf':
-            return supplier, parse_supplier_billback_pdf(filepath, cfg, customer_ref)
+            return _ret(supplier, parse_supplier_billback_pdf(filepath, cfg, customer_ref))
         return supplier, [{'_error': f'Unknown supplier format: {os.path.basename(filepath)}'}]
 
 # ─── OUTPUT BUILDER ──────────────────────────────────────────────────────────
@@ -3506,7 +3530,7 @@ function renderFiles() {
         <button class="remove-btn" onclick="removeFile(${i})" title="Remove">✕</button>
       </div>
       <div class="file-item-fields">
-        <label title="Override Program # for this file only">
+        <label title="Override Program # for this file only" id="prog_label_${i}">
           Prog #
           <input class="override-input" id="prog_${i}" placeholder="${progPlaceholder}">
         </label>
@@ -3518,10 +3542,36 @@ function renderFiles() {
           Customer Ref
           <input class="cref-input" id="cref_${i}" placeholder="auto-detect from file">
         </label>
+        <label title="Program: fill Program # / Trade=D  |  Operator: fill Operator ID / Trade=O">
+          Type
+          <select class="override-input" id="type_${i}" onchange="onTypeChange(${i})" style="width:90px;cursor:pointer;">
+            <option value="Program">Program</option>
+            <option value="Operator">Operator</option>
+          </select>
+        </label>
+        <label title="Operator name — used as Operator ID when Type = Operator" id="opname_label_${i}" style="display:none;">
+          Operator Name
+          <input class="override-input" id="opname_${i}" placeholder="e.g. Starbucks">
+        </label>
       </div>
     </div>`;
   }).join('');
   document.getElementById('process-btn').disabled = false;
+}
+
+function onTypeChange(i) {
+  const type = document.getElementById(`type_${i}`)?.value;
+  const progLabel  = document.getElementById(`prog_label_${i}`);
+  const opLabel    = document.getElementById(`opname_label_${i}`);
+  const progInput  = document.getElementById(`prog_${i}`);
+  if (type === 'Operator') {
+    if (progLabel)  progLabel.style.display  = 'none';
+    if (opLabel)    opLabel.style.display     = '';
+    if (progInput)  progInput.value           = '';   // clear program # for operator rows
+  } else {
+    if (progLabel)  progLabel.style.display   = '';
+    if (opLabel)    opLabel.style.display      = 'none';
+  }
 }
 
 function removeFile(idx) {
@@ -3567,11 +3617,16 @@ async function processFiles() {
   const config = getConfig();
   const fileOverrides = {};
   selectedFiles.forEach((f,i) => {
+    const rowType    = document.getElementById(`type_${i}`)?.value || 'Program';
+    const opName     = document.getElementById(`opname_${i}`)?.value.trim() || '';
+    const progVal    = rowType === 'Operator' ? '' : (document.getElementById(`prog_${i}`)?.value.trim() || '');
     fileOverrides[f.name] = {
-      supplier:    document.getElementById(`supplier_${i}`)?.value || '',
-      program_num: document.getElementById(`prog_${i}`)?.value.trim() || '',
-      dist_id:     document.getElementById(`dist_${i}`)?.value.trim() || '',
-      customer_ref:document.getElementById(`cref_${i}`)?.value.trim() || '',
+      supplier:     document.getElementById(`supplier_${i}`)?.value || '',
+      program_num:  progVal,
+      dist_id:      document.getElementById(`dist_${i}`)?.value.trim() || '',
+      customer_ref: document.getElementById(`cref_${i}`)?.value.trim() || '',
+      row_type:     rowType,       // 'Program' or 'Operator'
+      operator_name: opName,       // used as Operator ID when type=Operator
     };
   });
 
