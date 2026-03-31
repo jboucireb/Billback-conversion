@@ -2990,8 +2990,8 @@ def detect_and_parse(filepath, user_config=None, customer_ref='', file_override=
     # Capture operator override settings to apply after parsing
     _operator_override = cfg.get('operator_id', '') if cfg.get('trade') == 'O' else ''
 
-    # If user explicitly selected a distributor, use that name as the Source label
-    _source_override = (file_override or {}).get('supplier', '').strip()
+    # If user explicitly selected a distributor, use that display name as the Source label
+    _source_override = (file_override or {}).get('supplier_display', '').strip()
 
     def _apply_type_override(rows):
         """After parsing, patch trade indicator, operator ID, and source name."""
@@ -3629,12 +3629,13 @@ async function processFiles() {
     const opName     = document.getElementById(`opname_${i}`)?.value.trim() || '';
     const progVal    = rowType === 'Operator' ? '' : (document.getElementById(`prog_${i}`)?.value.trim() || '');
     fileOverrides[f.name] = {
-      supplier:     document.getElementById(`supplier_${i}`)?.value || '',
-      program_num:  progVal,
-      dist_id:      document.getElementById(`dist_${i}`)?.value.trim() || '',
-      customer_ref: document.getElementById(`cref_${i}`)?.value.trim() || '',
-      row_type:     rowType,       // 'Program' or 'Operator'
-      operator_name: opName,       // used as Operator ID when type=Operator
+      supplier:          document.getElementById(`supplier_${i}`)?.value || '',
+      supplier_display:  document.getElementById(`supplier_text_${i}`)?.value.trim() || '',
+      program_num:       progVal,
+      dist_id:           document.getElementById(`dist_${i}`)?.value.trim() || '',
+      customer_ref:      document.getElementById(`cref_${i}`)?.value.trim() || '',
+      row_type:          rowType,
+      operator_name:     opName,
     };
   });
 
