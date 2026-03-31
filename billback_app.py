@@ -2030,7 +2030,7 @@ def parse_sw_pdf(filepath, cfg, customer_ref):
             r'MONIN\s+([\d/]+\s*(?:LT|ML|L)?)\s+'  # PackSize after MONIN
             r'(?:\w+\s+)*?'                          # Description words (non-greedy)
             r'([A-Z]-[A-Z0-9]+|\d{6})\s+'           # Product ID: M-code or 6-digit number
-            r'\d{4,6}CS\s+'                          # DID (ignore)
+            r'\d{4,6}(?:CS)?\s+'                     # DID (ignore, CS suffix optional)
             r'\d{10,14}\s+'                          # UPC (ignore)
             r'(\d+\.?\d*)\s+'                        # Quantity
             r'[\d.]+\s+'                             # Total Weight (ignore)
@@ -2782,8 +2782,29 @@ def parse_supplier_billback_pdf(filepath, cfg, customer_ref):
     # S&W Trackmax PDF — uses numeric product IDs instead of M-codes
     if 'S&W Wholesale' in first_page or 's-wfoods' in first_page.lower():
         return parse_sw_pdf(filepath, cfg, customer_ref)
-    # Any Trackmax-format distributor: auto-detect company name from header
-    if 'Powered byTrackmax' in first_page or ('Product ID' in first_page and 'DID' in first_page and 'UPC' in first_page):
+    # SGC Foodservice / other Trackmax variants with no Total Charges column
+    # These use: M-code  DID(no CS)  UPC  Qty  Weight  BB To X/unit  $AmtDue
+    if 'SGC Foodservice' in first_page or 'sgcfoodservice' in first_page.lower():
+        return parse_sw_pdf(filepath, cfg, customer_ref)
+    # Detect Trackmax format that has NO separate Total Charges column
+    # (only one $ amount per line — Amount Due only)
+    # Check for "BB To" pattern without a preceding $XX Total Charges
+    if ('Product ID' in first_page and 'DID' in first_page and 'UPC' in first_page):
+        # Peek at content to choose the right Trackmax variant
+        try:
+            with pdfplumber.open(filepath) as _pdf:
+                _sample = _pdf.pages[0].extract_text() or ''
+            # If lines have "$X.XX BB To" (Total Charges before BB To) → standard Trackmax
+            # If lines have just "BB To ... $X.XX" at end → sw_pdf variant
+            import re as _re
+            _has_total_charges = bool(_re.search(r'\$[\d,.]+\s+BB\s+To', _sample, _re.I))
+        except Exception:
+            _has_total_charges = False
+        if _has_total_charges:
+            return parse_trackmax(filepath, cfg, customer_ref)
+        else:
+            return parse_sw_pdf(filepath, cfg, customer_ref)
+    if 'Powered byTrackmax' in first_page:
         return parse_trackmax(filepath, cfg, customer_ref)
     if 'BB Dept' in first_page and 'BB Vendor' in first_page:
         return parse_dot_foods_bb(filepath, cfg, customer_ref)
@@ -2998,9 +3019,9 @@ def detect_and_parse(filepath, user_config=None, customer_ref='', file_override=
     elif supplier == 'BLAIR_CANDY':
         return supplier, [{'_error': 'Blair Candy uses scanned/image PDFs — text extraction not supported. Please enter manually.'}]
     else:
-        # Try generic PDF
+        # Try content-based detection for PDFs (S&W, Martin Bros, Driscoll, Trackmax, etc.)
         if ext == '.pdf':
-            return supplier, parse_pfs(filepath, cfg, customer_ref)
+            return supplier, parse_supplier_billback_pdf(filepath, cfg, customer_ref)
         return supplier, [{'_error': f'Unknown supplier format: {os.path.basename(filepath)}'}]
 
 # ─── OUTPUT BUILDER ──────────────────────────────────────────────────────────
