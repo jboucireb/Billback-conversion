@@ -2521,6 +2521,9 @@ def parse_pfs(filepath, cfg, customer_ref):
     return rows
 
 def parse_yhata(filepath, cfg, customer_ref):
+    # Y. Hata uses Trackmax-format PDFs — route through the content-based dispatcher
+    if filepath.lower().endswith('.pdf'):
+        return parse_supplier_billback_pdf(filepath, cfg, customer_ref)
     rows = []
     try:
         with pdfplumber.open(filepath) as pdf:
@@ -2536,11 +2539,11 @@ def parse_yhata(filepath, cfg, customer_ref):
 
                 # Pattern: M-code  desc  UPC(8-20 digits)  qty  price  ext  allowance
                 detail_pat = re.compile(
-                    r'([A-Z]-[A-Z0-9]+)\s+.{0,60?}\s+\d{8,20}\s+(\d+)\s+\$?([\d,.]+)\s+\$?([\d,.]+)\s+\(?\$?([\d,.]+)\)?',
+                    r'([A-Z]-[A-Z0-9]+)\s+.{0,60}?\s+\d{8,20}\s+(\d+)\s+\$?([\d,.]+)\s+\$?([\d,.]+)\s+\(?\$?([\d,.]+)\)?',
                     re.I
                 )
                 detail_pat2 = re.compile(
-                    r'([A-Z]-[A-Z0-9]+)\s+.{0,60?}\s+\d+\s+(\d+)\s+\$?([\d,.]+)\s+\$?([\d,.]+)\s+\(?\$?([\d,.]+)\)?',
+                    r'([A-Z]-[A-Z0-9]+)\s+.{0,60}?\s+\d+\s+(\d+)\s+\$?([\d,.]+)\s+\$?([\d,.]+)\s+\(?\$?([\d,.]+)\)?',
                     re.I
                 )
                 matched = set()
@@ -2859,13 +2862,32 @@ def parse_dot_foods_bb(filepath, cfg, customer_ref):
     return rows
 
 
+def _pdfplumber_extract_first_page(filepath, timeout_s=25):
+    """Extract first-page text from a PDF with a timeout to prevent hanging on Render.
+    Returns (text_str, error_str) — one of them will be None."""
+    import concurrent.futures
+    def _extract():
+        with pdfplumber.open(filepath) as pdf:
+            return pdf.pages[0].extract_text() or ''
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as exe:
+            future = exe.submit(_extract)
+            try:
+                text = future.result(timeout=timeout_s)
+                return text, None
+            except concurrent.futures.TimeoutError:
+                return None, 'PDF processing timed out (file may be too large or corrupt)'
+            except Exception as e:
+                return None, str(e)
+    except Exception as e:
+        return None, str(e)
+
+
 def parse_supplier_billback_pdf(filepath, cfg, customer_ref):
     """Content-based dispatcher for 'Supplier Billback' PDFs — multiple distributors use this filename."""
-    try:
-        with pdfplumber.open(filepath) as pdf:
-            first_page = pdf.pages[0].extract_text() or ''
-    except Exception as e:
-        return [{'_error': f'Could not read PDF: {e}'}]
+    first_page, err = _pdfplumber_extract_first_page(filepath)
+    if err is not None:
+        return [{'_error': f'Could not read PDF: {err}'}]
 
     # Scanned / image-based PDF — no extractable text
     if len(first_page.strip()) < 50:
@@ -4092,8 +4114,20 @@ class BillbackHandler(BaseHTTPRequestHandler):
             self._respond_json(resp)
 
         except Exception as e:
-            self._respond_json({'error': str(e), 'trace': traceback.format_exc(),
-                                'results': [], 'download_id': None})
+            try:
+                self._respond_json({'error': str(e), 'trace': traceback.format_exc(),
+                                    'results': [], 'download_id': None, 'total_rows': 0})
+            except Exception:
+                # Last resort — connection may be broken; send a bare minimal body
+                try:
+                    body = b'{"error":"Internal server error","results":[],"download_id":null,"total_rows":0}'
+                    self.send_response(500)
+                    self.send_header('Content-Type', 'application/json')
+                    self.send_header('Content-Length', str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                except Exception:
+                    pass  # Socket is dead; nothing we can do
 
     def _respond_json(self, data):
         body = json.dumps(data).encode()
