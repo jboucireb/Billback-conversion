@@ -2357,6 +2357,77 @@ def parse_kast(filepath, cfg, customer_ref):
         rows.append({'_error': str(e)})
     return rows
 
+def parse_dot_foods_bb_xlsx(filepath, cfg, customer_ref):
+    """DOT Foods BB format delivered as XLSX (used by SOFO and others).
+    Structure: header rows with Invoice#/Date, then a data table with BB Dept / BB Vendor #
+    columns. Monin rows identified by Vendor Number == 140469."""
+    rows = []
+    try:
+        raw = pd.read_excel(filepath, sheet_name=0, header=None, nrows=15)
+
+        # Extract invoice date and number from the top header rows
+        bill_date = ''
+        inv_num   = ''
+        header_row_idx = None
+        for i, row in raw.iterrows():
+            vals = [str(v).strip() for v in row if str(v) not in ('nan', 'None', '')]
+            joined = ' '.join(vals).lower()
+            if 'invoice date' in joined:
+                for v in vals:
+                    d = to_yyyymmdd(v)
+                    if d: bill_date = d; break
+            if re.search(r'invoice\s*#', joined):
+                for v in vals:
+                    if re.match(r'\d{6,}$', v): inv_num = v; break
+            if 'bb dept' in joined:
+                header_row_idx = i
+                break
+
+        if header_row_idx is None:
+            return [{'_error': 'DOT Foods BB XLSX: could not find BB Dept header row'}]
+
+        df = pd.read_excel(filepath, sheet_name=0, header=header_row_idx)
+
+        # Filter to Monin rows only (Vendor Number = 140469)
+        df['Vendor Number'] = pd.to_numeric(df.get('Vendor Number', pd.Series(dtype=float)),
+                                             errors='coerce')
+        monin = df[df['Vendor Number'] == 140469].copy()
+        if monin.empty:
+            return [{'_error': 'DOT Foods BB XLSX: no Monin rows found (Vendor Number 140469)'}]
+
+        # Date range from Invoice Date column
+        dates = [to_yyyymmdd(v) for v in monin.get('Invoice Date', []) if to_yyyymmdd(v)]
+        start_date = min(dates) if dates else bill_date
+        end_date   = max(dates) if dates else bill_date
+
+        if not customer_ref and inv_num:
+            customer_ref = inv_num
+
+        # Aggregate by Vendor Item# (M-code)
+        from collections import defaultdict
+        totals_qty = defaultdict(float)
+        totals_amt = defaultdict(float)
+        for _, row in monin.iterrows():
+            code = str(row.get('Vendor Item#', '') or '').strip().upper()
+            if not code or code == 'NAN': continue
+            totals_qty[code] += float(row.get('Qty', 0) or 0)
+            totals_amt[code] += float(row.get('Ded', 0) or 0)
+
+        if not totals_amt:
+            return [{'_error': 'DOT Foods BB XLSX: no product rows after filtering'}]
+
+        for code, amt in totals_amt.items():
+            rows.append(make_row(
+                source='SOFO', program_num=cfg['program_num'],
+                customer_ref=customer_ref, dist_id=cfg['dist_id'],
+                bill_date=bill_date, start_date=start_date, end_date=end_date,
+                item=code, qty=totals_qty[code], amount=amt, trade=cfg['trade'],
+            ))
+    except Exception as e:
+        rows.append({'_error': f'DOT Foods BB XLSX: {e}'})
+    return rows
+
+
 def parse_sofo(filepath, cfg, customer_ref):
     """SOFO Foods — may arrive as DOT Foods BB format or Trackmax format; detect by content."""
     if filepath.lower().endswith('.pdf'):
@@ -2371,7 +2442,20 @@ def parse_sofo(filepath, cfg, customer_ref):
         # Trackmax-hosted SOFO files
         if 'Powered byTrackmax' in first_page or ('Product ID' in first_page and 'DID' in first_page):
             return parse_trackmax(filepath, cfg, customer_ref, source_name='SOFO')
-    # Native SOFO format (XLS/XLSX/PDF with direct M-code columns)
+    # XLSX/XLS — detect format by content
+    if filepath.lower().endswith(('.xlsx', '.xls')):
+        try:
+            df_peek = pd.read_excel(filepath, header=None, nrows=15)
+            flat = ' '.join(str(v) for row in df_peek.values for v in row if str(v) != 'nan')
+            if 'BB Dept' in flat:
+                return parse_dot_foods_bb_xlsx(filepath, cfg, customer_ref)
+            if 'Cheney Invoice No' in flat:
+                return parse_cheney(filepath, cfg, customer_ref)
+        except Exception:
+            pass
+        return [{'_error': 'SOFO XLSX: unrecognised format — please share the file to add support.'}]
+
+    # Native SOFO PDF format (direct M-code columns)
     rows = []
     try:
         with pdfplumber.open(filepath) as pdf:
@@ -2903,8 +2987,11 @@ def parse_harbor(filepath, cfg, customer_ref):
         return parse_supplier_billback_pdf(filepath, cfg, customer_ref)
     # Content-based XLSX detection — route other formats before trying Harbor columns
     try:
-        df_peek = pd.read_excel(filepath, header=0, nrows=0)
-        if 'Cheney Invoice No' in df_peek.columns:
+        df_peek = pd.read_excel(filepath, header=None, nrows=15)
+        flat = ' '.join(str(v) for row in df_peek.values for v in row if str(v) != 'nan')
+        if 'BB Dept' in flat:
+            return parse_dot_foods_bb_xlsx(filepath, cfg, customer_ref)
+        if 'Cheney Invoice No' in flat:
             return parse_cheney(filepath, cfg, customer_ref)
     except Exception:
         pass
