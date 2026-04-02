@@ -2033,15 +2033,15 @@ def parse_sw_pdf(filepath, cfg, customer_ref, source_override=''):
         # Line pattern: also capture PackSize (before product ID) for item lookup
         # Format: ... MONIN <PackSize> <Description> <ProductID> <DID>CS <UPC> <Qty> <Wt> BB To .../unit $<Amt>
         line_pat = re.compile(
-            r'MONIN\s+([\d/.]+(?:\s+\d+)?(?:\s*(?:LT|ML|L|OZ))?)\s+'  # PackSize: "4/1 LT","12/750","4 1 LT","4/33.8 OZ"
+            r'MONIN\s+([\d/.]+(?:\s+\d+)?(?:\s*(?:LITER|LITERS|LTR|LT|ML|L|OZ|EA))?)\s+'  # PackSize: "4/1 LT","4/1LTR","4/1LITER","1/EA","12/750"
             r'(?:\S+\s+)*?'                            # Description words (non-greedy, allows commas)
-            r'([A-Z]-[A-Z0-9]+|\d{6})\s+'             # Product ID: M-code or 6-digit number
-            r'\d{4,6}(?:CS)?\s+'                       # DID (ignore, CS suffix optional)
+            r'([A-Z]-[A-Z0-9]+|[A-Z]\d{3,5}|\d{5,6})\s+'  # Product ID: M-code, P240-style, 5-or-6-digit number
+            r'\w{3,8}\s+'                              # DID (flexible: digits+optional letter suffix e.g. 300527K, 4680CS)
             r'(?:\d{10,16}\s+)?'                       # UPC (optional, up to 16 digits)
-            r'(\d+\.?\d*)\s+'                          # Quantity
+            r'(\d[\d,]*\.?\d*)\s+'                     # Quantity (allow comma-thousands)
             r'[\d,.]+\s+'                              # Total Weight (ignore, may have comma)
-            r'(?:\$[\d,.]+\s+)?'                       # Total Charges (optional — Y.Hata has it, S&W doesn't)
-            r'BB\s+To\s+[\d.]+/unit\s+'               # Program Amount (ignore)
+            r'(?:\$[\d,.]+\s+){0,2}'                   # 0-2 pre-amounts: TotalCharges, FOB, DEL (variant-dependent)
+            r'(?:BB\s+To\s+[\d.]+/unit|[\d.]+\s*%\s+of\s+(?:FOB|Del)(?:Charges)?(?:\s+Cost)?)\s+'  # Program Amount
             r'\$([\d,.]+)',                             # Amount Due
             re.I
         )
@@ -2782,6 +2782,10 @@ def parse_supplier_billback_pdf(filepath, cfg, customer_ref):
     except Exception as e:
         return [{'_error': f'Could not read PDF: {e}'}]
 
+    # Scanned / image-based PDF — no extractable text
+    if len(first_page.strip()) < 50:
+        return [{'_error': 'This PDF appears to be image-based (scanned). Text extraction is not supported — please enter the data manually or request a text-based PDF from the distributor.'}]
+
     if 'Martin Bros' in first_page:
         return parse_martin_bros(filepath, cfg, customer_ref)
     if 'Driscoll Foods' in first_page:
@@ -2798,9 +2802,13 @@ def parse_supplier_billback_pdf(filepath, cfg, customer_ref):
     # Check for "BB To" pattern without a preceding $XX Total Charges
     if ('Product ID' in first_page and 'DID' in first_page and 'UPC' in first_page):
         # Choose Trackmax variant by program amount format:
-        #   "BB To X.000/unit $Y"  → S&W/SGC style (parse_sw_pdf)
-        #   "X.00 % of Del $Y"     → BEK/Driscoll style (parse_trackmax)
+        #   "BB To X.000/unit $Y"            → S&W/SGC/Y.Hata/ChristPanos style (parse_sw_pdf)
+        #   "X% of FOB/Del" + "DOT FOODS"   → Dennis/Springfield/similar DOT-distributed (parse_sw_pdf)
+        #   "X.00 % of Del $Y" (no DOT)     → BEK/Driscoll style (parse_trackmax)
         if re.search(r'BB\s+To\s+[\d.]+/unit', first_page, re.I):
+            return parse_sw_pdf(filepath, cfg, customer_ref)
+        elif (re.search(r'%\s+of\s+(?:FOB|Del)', first_page, re.I)
+              and 'DOT FOODS' in first_page):
             return parse_sw_pdf(filepath, cfg, customer_ref)
         else:
             return parse_trackmax(filepath, cfg, customer_ref)
@@ -3398,8 +3406,8 @@ function distNameToKey(name) {
   if (u.includes('MARTINBROS')) return 'MARTIN_BROS';
   if (u.includes('DRISCOLL')) return 'DRISCOLL';
   if (u.includes('HARBOR')) return 'HARBOR';
-  // Everything else: route through content-based PDF dispatcher
-  return 'HARBOR';
+  // Everything else: route through content-based PDF dispatcher (don't force Harbor)
+  return 'UNKNOWN';
 }
 
 // Map parser key → display name for auto-detect
