@@ -1682,6 +1682,7 @@ DEFAULT_SUPPLIER_CONFIG = {
     'MCLANE':     {'program_num': '',        'dist_id': '',           'trade': 'D'},
     'S_AND_W':    {'program_num': '',        'dist_id': '',           'trade': 'D'},
     'BLAIR_CANDY':{'program_num': '',        'dist_id': '',           'trade': 'D'},
+    'CHENEY':      {'program_num': '',        'dist_id': '',           'trade': 'D'},
     'HARBOR':      {'program_num': '',        'dist_id': '',           'trade': 'D'},
     'MARTIN_BROS':  {'program_num': '',        'dist_id': '',           'trade': 'D'},
     'DOT_FOODS_BB': {'program_num': '',        'dist_id': '',           'trade': 'D'},
@@ -2854,10 +2855,59 @@ def parse_supplier_billback_pdf(filepath, cfg, customer_ref):
     return rows
 
 
+def parse_cheney(filepath, cfg, customer_ref):
+    """Cheney Brothers XLSX billback.
+    Columns: Manufacture Part Number (M-code), Quantity, Net Value, Document Date, CLAIM NO"""
+    rows = []
+    try:
+        df = pd.read_excel(filepath, header=0)
+        # Dates
+        bill_dates = [to_yyyymmdd(v) for v in df.get('Document Date', []) if to_yyyymmdd(v)]
+        bill_date  = bill_dates[0]  if bill_dates else ''
+        start_date = min(bill_dates) if bill_dates else ''
+        end_date   = max(bill_dates) if bill_dates else ''
+        # Customer ref from CLAIM NO
+        if not customer_ref and 'CLAIM NO' in df.columns:
+            cr = df['CLAIM NO'].iloc[0]
+            if pd.notna(cr):
+                customer_ref = str(int(cr)) if isinstance(cr, (float, int)) else str(cr)
+        # Aggregate by M-code
+        from collections import defaultdict
+        totals_qty = defaultdict(float)
+        totals_amt = defaultdict(float)
+        for _, row in df.iterrows():
+            raw = str(row.get('Manufacture Part Number', '') or '').strip()
+            if not raw or raw.lower() == 'nan':
+                continue
+            code = raw.upper()
+            totals_qty[code] += float(row.get('Quantity', 0) or 0)
+            totals_amt[code] += float(row.get('Net Value',  0) or 0)
+        if not totals_amt:
+            return [{'_error': 'Cheney: no product rows found (missing Manufacture Part Number or Net Value)'}]
+        for code, amt in totals_amt.items():
+            rows.append(make_row(
+                source='Cheney Brothers',
+                program_num=cfg['program_num'], customer_ref=customer_ref,
+                dist_id=cfg['dist_id'], bill_date=bill_date,
+                start_date=start_date, end_date=end_date,
+                item=code, qty=totals_qty[code], amount=amt, trade=cfg['trade'],
+            ))
+    except Exception as e:
+        rows.append({'_error': f'Cheney: {e}'})
+    return rows
+
+
 def parse_harbor(filepath, cfg, customer_ref):
     """Harbor Foodservice 'Supplier Billback' — XLSX only; PDFs routed by content."""
     if filepath.lower().endswith('.pdf'):
         return parse_supplier_billback_pdf(filepath, cfg, customer_ref)
+    # Content-based XLSX detection — route other formats before trying Harbor columns
+    try:
+        df_peek = pd.read_excel(filepath, header=0, nrows=0)
+        if 'Cheney Invoice No' in df_peek.columns:
+            return parse_cheney(filepath, cfg, customer_ref)
+    except Exception:
+        pass
     rows = []
     try:
         wb = __import__('openpyxl').load_workbook(filepath, data_only=True)
@@ -3052,6 +3102,8 @@ def detect_and_parse(filepath, user_config=None, customer_ref='', file_override=
         return _ret(supplier, parse_martin_bros(filepath, cfg, customer_ref))
     elif supplier == 'DRISCOLL':
         return _ret(supplier, parse_driscoll(filepath, cfg, customer_ref))
+    elif supplier == 'CHENEY':
+        return _ret(supplier, parse_cheney(filepath, cfg, customer_ref))
     elif supplier == 'BLAIR_CANDY':
         return supplier, [{'_error': 'Blair Candy uses scanned/image PDFs — text extraction not supported. Please enter manually.'}]
     else:
@@ -3217,7 +3269,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 </div>
 
 <script>
-const SUPPLIERS = ['KAST','SOFO','PFS','LABATT','Y_HATA','BEK','NICH_CO','SHAMROCK','DOT_CBBB','MCLANE','S_AND_W','HARBOR','MARTIN_BROS','DOT_FOODS_BB','DRISCOLL'];
+const SUPPLIERS = ['KAST','SOFO','PFS','LABATT','Y_HATA','BEK','NICH_CO','SHAMROCK','DOT_CBBB','MCLANE','S_AND_W','CHENEY','HARBOR','MARTIN_BROS','DOT_FOODS_BB','DRISCOLL'];
 const DEFAULT_CFG = {
   KAST:    {program_num:'1004089', dist_id:'134810000', trade:'D'},
   SOFO:    {program_num:'', dist_id:'', trade:'D'},
@@ -3230,6 +3282,7 @@ const DEFAULT_CFG = {
   DOT_CBBB:{program_num:'', dist_id:'', trade:'D'},
   MCLANE:  {program_num:'', dist_id:'', trade:'D'},
   S_AND_W: {program_num:'', dist_id:'', trade:'D'},
+  CHENEY:  {program_num:'', dist_id:'', trade:'D'},
   HARBOR:      {program_num:'', dist_id:'', trade:'D'},
   MARTIN_BROS:  {program_num:'', dist_id:'', trade:'D'},
   DOT_FOODS_BB: {program_num:'', dist_id:'', trade:'D'},
@@ -3405,6 +3458,7 @@ function distNameToKey(name) {
   if (u.includes('MARTINBROS')) return 'MARTIN_BROS';
   if (u.includes('DRISCOLL')) return 'DRISCOLL';
   if (u.includes('HARBOR')) return 'HARBOR';
+  if (u.includes('CHENEY')) return 'CHENEY';
   // Everything else: route through content-based PDF dispatcher (don't force Harbor)
   return 'UNKNOWN';
 }
@@ -3413,7 +3467,7 @@ function distNameToKey(name) {
 const KEY_TO_DISPLAY = {
   KAST:'Kast', SOFO:'SOFO', PFS:'PFS', LABATT:'Labatt FS',
   Y_HATA:'Y Hata', BEK:'BEK', NICH_CO:'Nicholas&Co', SHAMROCK:'SHAMROCK',
-  DOT_CBBB:'DOT', MCLANE:'McLane FS', S_AND_W:'S&W',
+  DOT_CBBB:'DOT', MCLANE:'McLane FS', S_AND_W:'S&W', CHENEY:'Cheney Brothers',
   HARBOR:'Harbor', MARTIN_BROS:'Martin Bros',
   DOT_FOODS_BB:'DOT', DRISCOLL:'Driscoll Foods',
   BLAIR_CANDY:'Blair Candy', UNKNOWN:''
