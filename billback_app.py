@@ -2998,9 +2998,8 @@ def detect_and_parse(filepath, user_config=None, customer_ref='', file_override=
     # Capture operator override settings to apply after parsing
     _operator_override = cfg.get('operator_id', '') if cfg.get('trade') == 'O' else ''
 
-    # Only override Source when user manually picked a distributor from the dropdown
-    _user_selected   = (file_override or {}).get('supplier_user_selected', False)
-    _source_override = (file_override or {}).get('supplier_display', '').strip() if _user_selected else ''
+    # Always use the dropdown display name as Source (whatever is showing in the UI)
+    _source_override = (file_override or {}).get('supplier_display', '').strip()
 
     def _apply_type_override(rows):
         """After parsing, patch trade indicator, operator ID, and source name."""
@@ -3482,7 +3481,6 @@ function selectDist(idx, name) {
   document.getElementById('supplier_text_'+idx).value = name;
   const hiddenEl = document.getElementById('supplier_'+idx);
   hiddenEl.value = key;
-  hiddenEl.dataset.userSelected = 'true';
   const inp  = document.getElementById('supplier_text_'+idx);
   inp.className = 'combo-input';
   hideDist(idx);
@@ -3641,9 +3639,8 @@ async function processFiles() {
     const progVal    = rowType === 'Operator' ? '' : (document.getElementById(`prog_${i}`)?.value.trim() || '');
     const supplierEl = document.getElementById(`supplier_${i}`);
     fileOverrides[f.name] = {
-      supplier:               supplierEl?.value || '',
-      supplier_display:       document.getElementById(`supplier_text_${i}`)?.value.trim() || '',
-      supplier_user_selected: supplierEl?.dataset.userSelected === 'true',
+      supplier:         supplierEl?.value || '',
+      supplier_display: document.getElementById(`supplier_text_${i}`)?.value.trim() || '',
       program_num:       progVal,
       dist_id:           document.getElementById(`dist_${i}`)?.value.trim() || '',
       customer_ref:      document.getElementById(`cref_${i}`)?.value.trim() || '',
