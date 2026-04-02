@@ -3782,6 +3782,68 @@ dz.ondrop = e => {
   renderFiles();
 };
 
+// Persists the last-used file overrides so retryFile() can re-use them
+let _lastOverrides = {};
+
+function friendlyError(msg) {
+  if (!msg) return 'Unknown error';
+  if (/image.based|scanned/i.test(msg))
+    return 'Scanned PDF — text cannot be extracted automatically. Please enter this one manually.';
+  if (/timed out/i.test(msg))
+    return 'File took too long to process (may be too large or corrupt).';
+  if (/no product rows|no monin|no M-code rows/i.test(msg))
+    return 'No Monin items found in file.';
+  if (/could not find header|header row/i.test(msg))
+    return 'File format not recognised — try selecting the correct distributor below.';
+  if (/nothing to repeat|invalid pattern|regex/i.test(msg))
+    return 'Parser error — try selecting the correct distributor below.';
+  if (/not a pdf|\/Root|xref/i.test(msg))
+    return 'File does not appear to be a valid PDF.';
+  if (/unknown supplier|unknown distributor/i.test(msg))
+    return 'Distributor not recognised — select the correct one below.';
+  return msg;
+}
+
+function _retrySelectHtml(filename, rIdx, currentKey) {
+  const opts = SUPPLIERS.map(k =>
+    `<option value="${k}" ${k===currentKey?'selected':''}>${KEY_TO_DISPLAY[k]||k}</option>`
+  ).join('');
+  const esc = filename.replace(/\\/g,'\\\\').replace(/'/g,"\\'");
+  return `
+    <div style="margin-top:10px;padding:10px 12px;background:#fef2f2;border-radius:6px;
+                border-left:3px solid #f87171;display:flex;flex-wrap:wrap;gap:8px;align-items:center">
+      <span style="font-size:.78rem;color:#7f1d1d;font-weight:600">↩ Try a different distributor:</span>
+      <select id="retry-sel-${rIdx}"
+              style="font-size:.8rem;padding:4px 6px;border:1px solid #fca5a5;border-radius:4px;background:#fff">
+        <option value="">— select —</option>
+        ${opts}
+      </select>
+      <button onclick="retryFile('${esc}',${rIdx})"
+              style="font-size:.78rem;padding:4px 12px;background:#dc2626;color:#fff;
+                     border:none;border-radius:4px;cursor:pointer;font-weight:600">
+        Retry
+      </button>
+    </div>`;
+}
+
+function retryFile(filename, rIdx) {
+  const sel = document.getElementById(`retry-sel-${rIdx}`);
+  if (!sel || !sel.value) { alert('Please select a distributor first.'); return; }
+  const key     = sel.value;
+  const display = KEY_TO_DISPLAY[key] || key;
+
+  // Update the upload-area dropdown for this file so processFiles() picks it up
+  const fileIdx = selectedFiles.findIndex(f => f.name === filename);
+  if (fileIdx === -1) { alert('File no longer available — please re-upload.'); return; }
+  const textEl   = document.getElementById(`supplier_text_${fileIdx}`);
+  const hiddenEl = document.getElementById(`supplier_${fileIdx}`);
+  if (textEl)   { textEl.value = display; textEl.className = 'combo-input'; }
+  if (hiddenEl) hiddenEl.value = key;
+
+  // Re-run everything with the updated distributor
+  processFiles();
+}
+
 async function processFiles() {
   if (!selectedFiles.length) return;
   const btn = document.getElementById('process-btn');
@@ -3811,6 +3873,7 @@ async function processFiles() {
       operator_name:     opName,
     };
   });
+  _lastOverrides = fileOverrides;
 
   const form = new FormData();
   selectedFiles.forEach(f => form.append('files', f));
@@ -3832,17 +3895,26 @@ async function processFiles() {
     let totalAmount = 0;
     let totalQty = 0;
     let hasErrors = false;
+    let rIdx = 0;
 
     data.results.forEach(r => {
+      const ri = rIdx++;
+      const currentKey = (fileOverrides[r.file] || {}).supplier || '';
       if (r.error) {
         hasErrors = true;
-        html += `<div class="result-row result-err">
-          <span>❌ <strong>${r.file}</strong> — ${r.error}</span>
+        const canRetry = !/scanned|image.based|not a pdf|timed out/i.test(r.error);
+        html += `<div class="result-row result-err" style="flex-direction:column;align-items:flex-start">
+          <span>❌ <strong>${r.file}</strong></span>
+          <span style="font-size:.82rem;color:#7f1d1d;margin-top:2px">${friendlyError(r.error)}</span>
+          ${canRetry ? _retrySelectHtml(r.file, ri, currentKey) : ''}
         </div>`;
       } else if (r.rows === 0) {
-        html += `<div class="result-row result-skip">
-          <span>⚠️ <strong>${r.file}</strong> <em>(${r.supplier})</em> — No Monin items found</span>
-          <span class="count-badge" style="background:#fef3c7;color:#92400e">0 rows</span>
+        html += `<div class="result-row result-skip" style="flex-direction:column;align-items:flex-start">
+          <div style="display:flex;justify-content:space-between;width:100%;flex-wrap:wrap;gap:4px">
+            <span>⚠️ <strong>${r.file}</strong> <em>(${r.supplier})</em> — No Monin items found</span>
+            <span class="count-badge" style="background:#fef3c7;color:#92400e">0 rows</span>
+          </div>
+          ${_retrySelectHtml(r.file, ri, currentKey)}
         </div>`;
       } else {
         totalRows += r.rows;
