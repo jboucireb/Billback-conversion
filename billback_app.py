@@ -1687,6 +1687,7 @@ DEFAULT_SUPPLIER_CONFIG = {
     'MARTIN_BROS':  {'program_num': '',        'dist_id': '',           'trade': 'D'},
     'DOT_FOODS_BB': {'program_num': '',        'dist_id': '',           'trade': 'D'},
     'DRISCOLL':     {'program_num': '',        'dist_id': '',           'trade': 'D'},
+    'TANKERSLEY':   {'program_num': '',        'dist_id': '',           'trade': 'D'},
     'UNKNOWN':      {'program_num': '',        'dist_id': '',           'trade': 'D'},
 }
 
@@ -1794,6 +1795,7 @@ def detect_supplier(filename):
     if 'BEK' in fn: return 'BEK'
     if 'NICH' in fn: return 'NICH_CO'
     if 'CBBB' in fn: return 'DOT_CBBB'
+    if 'TANKERSLEY' in fn: return 'TANKERSLEY'
     if re.search(r'Y[\s.]?HATA|Y_HATA|TM\s+\d{6}', fn): return 'Y_HATA'
     if 'DRISCOLL' in fn: return 'DRISCOLL'
     if 'HARBOR' in fn: return 'HARBOR'
@@ -2031,25 +2033,43 @@ def parse_sw_pdf(filepath, cfg, customer_ref, source_override=''):
             m2 = re.search(r'IMPORTANT!\s*\n([^\n]+)', all_text)
             if m2: source_name = m2.group(1).strip()
 
-        # Line pattern: also capture PackSize (before product ID) for item lookup
+        # Line pattern: positive invoice lines
         # Format: ... MONIN <PackSize> <Description> <ProductID> <DID>CS <UPC> <Qty> <Wt> BB To .../unit $<Amt>
         line_pat = re.compile(
-            r'MONIN\s+([\d/.]+(?:\s+\d+)?(?:\s*(?:LITER|LITERS|LTR|LT|ML|L|OZ|EA))?)\s+'  # PackSize: "4/1 LT","4/1LTR","4/1LITER","1/EA","12/750"
-            r'(?:\S+\s+)*?'                            # Description words (non-greedy, allows commas)
-            r'([A-Z]-[A-Z0-9]+|[A-Z]\d{3,5}|\d{5,6})\s+'  # Product ID: M-code, P240-style, 5-or-6-digit number
-            r'\w{3,8}\s+'                              # DID (flexible: digits+optional letter suffix e.g. 300527K, 4680CS)
-            r'(?:\d{10,16}\s+)?'                       # UPC (optional, up to 16 digits)
-            r'(\d[\d,]*\.?\d*)\s+'                     # Quantity (allow comma-thousands)
-            r'[\d,.]+\s+'                              # Total Weight (ignore, may have comma)
-            r'(?:\$[\d,.]+\s+){0,2}'                   # 0-2 pre-amounts: TotalCharges, FOB, DEL (variant-dependent)
-            r'(?:BB\s+To\s+[\d.]+/unit|[\d.]+\s*%\s+of\s+(?:FOB|Del)(?:Charges)?(?:\s+Cost)?)\s+'  # Program Amount
+            r'MONIN\s+([\d/.]+(?:\s+\d+)?(?:\s*(?:LITER|LITERS|LTR|LT|ML|L|OZ|EA))?)\s+'  # PackSize
+            r'(?:\S+\s+)*?'                            # Description words (non-greedy)
+            r'([A-Z]-[A-Z0-9]+|[A-Z]\d{3,5}|\d{5,6})\s+'  # Product ID
+            r'\w{3,8}\s+'                              # DID
+            r'(?:(?:\d{10,16}|[A-Z]-[A-Z0-9]+)\s+)?'   # UPC (numeric barcode OR M-code repeated as UPC)
+            r'(\d[\d,]*\.?\d*)\s+'                     # Quantity (must start with digit — rejects credit lines)
+            r'[\d,.]+\s+'                              # Total Weight
+            r'(?:\$[\d,.]+\s+){0,2}'                   # 0-2 pre-amounts
+            r'(?:BB\s+To\s+[\d.]+/unit|[\d.]+\s*%\s+of\s+(?:FOB|Del)(?:Charges)?(?:\s+Cost)?)\s+'
             r'\$([\d,.]+)',                             # Amount Due
             re.I
         )
 
-        # Also capture "Totals for Product <desc>:" to map product IDs to descriptions
-        totals_pat = re.compile(r'Totals for Product\s+(.+?):\s+[\d.]+\s+[\d.]+\s+\$([\d,.]+)', re.I)
-        prod_desc  = {}   # prod_id → description (from lines)
+        # Credit/return line pattern — qty and amount are in parentheses: (1.00) (weight) ($7.98)
+        credit_pat = re.compile(
+            r'MONIN\s+([\d/.]+(?:\s+\d+)?(?:\s*(?:LITER|LITERS|LTR|LT|ML|L|OZ|EA))?)\s+'
+            r'(?:\S+\s+)*?'
+            r'([A-Z]-[A-Z0-9]+|[A-Z]\d{3,5}|\d{5,6})\s+'
+            r'\w{3,8}\s+'
+            r'(?:(?:\d{10,16}|[A-Z]-[A-Z0-9]+)\s+)?'  # UPC (numeric barcode OR M-code repeated as UPC)
+            r'\((\d[\d,]*\.?\d*)\)\s+'   # qty in parens
+            r'\([\d,.]+\)\s+'            # weight in parens
+            r'(?:(?:\$[\d,.]+|\(\$[\d,.]+\))\s+){0,2}'  # 0-2 amounts: plain $X.XX or ($X.XX) for credit lines
+            r'(?:BB\s+To\s+[\d.]+/unit|[\d.]+\s*%\s+of\s+(?:FOB|Del)(?:Charges)?(?:\s+Cost)?)\s+'
+            r'\(\$([\d,.]+)\)',           # amount in parens — negative
+            re.I
+        )
+
+        # Processing fee pattern: "MONIN: <non-M-code> qty wt BB To <neg-rate>/unit $<amt>"
+        fee_pat = re.compile(
+            r'MONIN:\s+(\S+)\s+[\d.]+\s+[\d.]+\s+BB\s+To\s+[-\d.]+/unit\s+\$([\d,.]+)',
+            re.I
+        )
+
         prod_pack  = {}   # prod_id → pack size
 
         # Aggregate by product ID
@@ -2066,6 +2086,14 @@ def parse_sw_pdf(filepath, cfg, customer_ref, source_override=''):
             totals_amt[prod_id] += amt
             if prod_id not in prod_pack:
                 prod_pack[prod_id] = pack_size
+
+        # Subtract credit/return lines (qty and amount in parentheses)
+        for m in credit_pat.finditer(all_text):
+            prod_id = m.group(2).upper()
+            qty     = float(m.group(3))
+            amt     = float(m.group(4).replace(',', ''))
+            totals_qty[prod_id] -= qty
+            totals_amt[prod_id] -= amt
 
         if not totals_qty:
             return [{'_error': 'S&W PDF: no product rows found — format may have changed'}]
@@ -2096,6 +2124,12 @@ def parse_sw_pdf(filepath, cfg, customer_ref, source_override=''):
                 amount=round(totals_amt[prod_id], 2),
                 trade=cfg['trade']
             ))
+        # Warn about processing fees (no M-code — can't go into Tellus automatically)
+        for m in fee_pat.finditer(all_text):
+            prod = m.group(1)
+            amt  = float(m.group(2).replace(',', ''))
+            rows.append({'_warning': True, 'code': prod, 'desc': 'Processing Fee (no M-code)', 'amount': amt})
+
     except Exception as e:
         rows.append({'_error': f'S&W PDF: {e}'})
     return rows
@@ -3195,6 +3229,9 @@ def detect_and_parse(filepath, user_config=None, customer_ref='', file_override=
         return _ret(supplier, parse_pfs(filepath, cfg, customer_ref))
     elif supplier == 'Y_HATA':
         return _ret(supplier, parse_yhata(filepath, cfg, customer_ref))
+    elif supplier == 'TANKERSLEY':
+        # Tankersley uses the same Trackmax PDF format — route through content-based dispatcher
+        return _ret(supplier, parse_supplier_billback_pdf(filepath, cfg, customer_ref))
     elif supplier == 'LABATT':
         return _ret(supplier, parse_labatt(filepath, cfg, customer_ref))
     elif supplier == 'HARBOR':
@@ -3378,7 +3415,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 </div>
 
 <script>
-const SUPPLIERS = ['KAST','SOFO','PFS','LABATT','Y_HATA','BEK','NICH_CO','SHAMROCK','DOT_CBBB','MCLANE','S_AND_W','CHENEY','HARBOR','MARTIN_BROS','DOT_FOODS_BB','DRISCOLL'];
+const SUPPLIERS = ['KAST','SOFO','PFS','LABATT','Y_HATA','BEK','NICH_CO','SHAMROCK','DOT_CBBB','MCLANE','S_AND_W','CHENEY','HARBOR','MARTIN_BROS','DOT_FOODS_BB','DRISCOLL','TANKERSLEY'];
 const DEFAULT_CFG = {
   KAST:    {program_num:'1004089', dist_id:'134810000', trade:'D'},
   SOFO:    {program_num:'', dist_id:'', trade:'D'},
@@ -3396,6 +3433,7 @@ const DEFAULT_CFG = {
   MARTIN_BROS:  {program_num:'', dist_id:'', trade:'D'},
   DOT_FOODS_BB: {program_num:'', dist_id:'', trade:'D'},
   DRISCOLL:     {program_num:'', dist_id:'', trade:'D'},
+  TANKERSLEY:   {program_num:'', dist_id:'', trade:'D'},
 };
 
 // ── Config persistence (localStorage) ────────────────────────────────────────
@@ -3539,6 +3577,7 @@ function detectSupplier(filename) {
   if (fn.includes('BEK'))     return 'BEK';
   if (fn.includes('NICH'))    return 'NICH_CO';
   if (fn.includes('CBBB'))    return 'DOT_CBBB';
+  if (fn.includes('TANKERSLEY')) return 'TANKERSLEY';
   if (/Y[\s.]?HATA|Y_HATA/.test(fn)) return 'Y_HATA';
   if (fn.includes('DRISCOLL')) return 'DRISCOLL';
   if (fn.includes('HARBOR') || fn.includes('SUPPLIER BILLBACK') || fn.includes('SUPPLIER_BILLBACK')) return 'HARBOR';
@@ -3578,7 +3617,7 @@ const KEY_TO_DISPLAY = {
   Y_HATA:'Y Hata', BEK:'BEK', NICH_CO:'Nicholas&Co', SHAMROCK:'SHAMROCK',
   DOT_CBBB:'DOT', MCLANE:'McLane FS', S_AND_W:'S&W', CHENEY:'Cheney Brothers',
   HARBOR:'Harbor', MARTIN_BROS:'Martin Bros',
-  DOT_FOODS_BB:'DOT', DRISCOLL:'Driscoll Foods',
+  DOT_FOODS_BB:'DOT', DRISCOLL:'Driscoll Foods', TANKERSLEY:'Tankersley',
   BLAIR_CANDY:'Blair Candy', UNKNOWN:''
 };
 
