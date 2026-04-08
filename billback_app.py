@@ -2772,12 +2772,14 @@ def parse_trackmax(filepath, cfg, customer_ref, source_name=''):
         # Data line pattern — matches both regular and credit/return lines:
         #   Regular:  019926 02/13/2026 ... M-FR035F 350377 10738337884136 1.00  11.53 $31.44 BB To 22.400/unit $9.04
         #   Credit:   X97707 02/20/2026 ... M-FR035F 350377 10738337884136 (1.00) (11.53) ($31.44) BB To 22.400/unit ($9.04)
-        # Also handles truncated UPC (10-11 chars) when pdfplumber wraps the line.
+        #   Fully Excluded (Y.Hata): ...M-FR036F 256271 0110738337060868 (1.00) (12.50) ($31.44) ($31.44) -10.00 % of FOB ($3.14)
+        # Also handles: UPCs up to 18 digits; M-codes with hyphen dropped by pdfplumber (e.g. MFR066F)
         line_pat = re.compile(
-            r'([A-Z]-[A-Z0-9]+)\s+\d{4,9}\s+(?:\d{8,14}\s+)?'  # M-code, DID (4-9d), UPC optional (8-14d)
+            r'([A-Z]-?[A-Z][A-Z0-9]+)\s+\d{4,9}\s+(?:\d{8,18}\s+)?'  # M-code (hyphen optional), DID, UPC optional (up to 18d)
             r'(\([\d.]+\)|[\d.]+)\s+'                    # qty: positive or (negative)
             r'[\d,.()]+\s+'                              # weight (ignore, may have comma e.g. 1,268.40)
-            r'(?:\(\$[\d,.]+\)|\$[-\d,.]+)\s+'          # Total Charges (ignore, may be negative $-X.XX)
+            r'(?:\(\$[\d,.]+\)|\$[-\d,.]+)\s+'          # Total Charges 1 (ignore, may be negative $-X.XX)
+            r'(?:(?:\(\$[\d,.]+\)|\$[-\d,.]+)\s+)?'     # Total Charges 2 (optional — Fully Excluded Sales format)
             r'\S.*?'                                     # Program Amount text
             r'(\(\$[\d,.]+\)|\$[-\d,.]+)',               # Amount Due (last $ value)
             re.I
@@ -2795,6 +2797,9 @@ def parse_trackmax(filepath, cfg, customer_ref, source_name=''):
             seen_lines.add(line)
 
             item = m.group(1).upper()
+            # Restore missing hyphen that pdfplumber sometimes drops (e.g. MFR066F → M-FR066F)
+            if len(item) > 1 and item[1] != '-':
+                item = item[0] + '-' + item[1:]
             raw_qty = m.group(2)
             raw_amt = m.group(3)
 
