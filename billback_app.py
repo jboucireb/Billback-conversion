@@ -1687,7 +1687,37 @@ DEFAULT_SUPPLIER_CONFIG = {
     'MARTIN_BROS':  {'program_num': '',        'dist_id': '',           'trade': 'D'},
     'DOT_FOODS_BB': {'program_num': '',        'dist_id': '',           'trade': 'D'},
     'DRISCOLL':     {'program_num': '',        'dist_id': '',           'trade': 'D'},
-    'TANKERSLEY':   {'program_num': '',        'dist_id': '',           'trade': 'D'},
+    'TANKERSLEY':    {'program_num': '',        'dist_id': '',           'trade': 'D'},
+    'CHRIST_PANOS':  {'program_num': '',        'dist_id': '',           'trade': 'D',
+        'did_map': {
+            '300514': 'M-FR006F',
+            '300513': 'M-FR008F',
+            '380169': 'M-RP008F',
+            '380177': 'M-FR112F',
+            '300503': 'M-FR009F',
+            '380178': 'M-FR268F',
+            '300505': 'M-FT080F',
+            '380176': 'M-FR012F',
+            '300533': 'M-FR247F',
+            '300144': 'M-FR190F',
+            '300143': 'M-FR021F',
+            '300140': 'M-FR023F',
+            '300512': 'M-FR032F',
+            '300504': 'M-FR036F',
+            '300507': 'M-FR050F',
+            '380173': 'M-FR039F',
+            '300500': 'M-FR075F',
+            '300502': 'M-FR040F',
+            '300171': 'M-GC009FP',
+            '300149': 'M-GC062FP',
+            '300159': 'M-GC063FP',
+            '300510': 'M-FR042F',
+            '300158': 'M-RP042F',
+            '300501': 'M-FR045F',
+            '300508': 'M-FS045F',
+            '300509': 'M-FR136F',
+        }
+    },
     'UNKNOWN':      {'program_num': '',        'dist_id': '',           'trade': 'D'},
 }
 
@@ -1796,6 +1826,7 @@ def detect_supplier(filename):
     if 'NICH' in fn: return 'NICH_CO'
     if 'CBBB' in fn: return 'DOT_CBBB'
     if 'TANKERSLEY' in fn: return 'TANKERSLEY'
+    if re.search(r'CHRIST.*PANOS|PANOS.*CHRIST', fn): return 'CHRIST_PANOS'
     if re.search(r'Y[\s.]?HATA|Y_HATA|TM\s+\d{6}', fn): return 'Y_HATA'
     if 'DRISCOLL' in fn: return 'DRISCOLL'
     if 'HARBOR' in fn: return 'HARBOR'
@@ -2011,6 +2042,8 @@ def parse_sw_pdf(filepath, cfg, customer_ref, source_override=''):
     try:
         with pdfplumber.open(filepath) as pdf:
             all_text = '\n'.join(page.extract_text() or '' for page in pdf.pages)
+        # No full-text dedup here — short lines like "STRAWBERRY Cost" repeat legitimately.
+        # Instead we deduplicate at the match level using a seen_matches set below.
 
         # Dates
         bill_date = start_date = end_date = ''
@@ -2071,24 +2104,65 @@ def parse_sw_pdf(filepath, cfg, customer_ref, source_override=''):
         )
 
         prod_pack  = {}   # prod_id → pack size
+        prod_desc  = {}   # prod_id → description text (for numeric ID → M-code lookup)
+        prod_did   = {}   # prod_id → DID value (for did_map lookup)
+        did_map    = cfg.get('did_map', {})
 
         # Aggregate by product ID
         from collections import defaultdict
         totals_qty = defaultdict(float)
         totals_amt = defaultdict(float)
+        seen_matches = set()   # deduplicate page-boundary repeated MONIN lines
 
         for m in line_pat.finditer(all_text):
+            # Key = full source line (includes invoice# before MONIN), so identical
+            # product lines from different invoices are NOT deduplicated.
+            line_start = all_text.rfind('\n', 0, m.start()) + 1
+            match_key = all_text[line_start:m.end()][:200]
+            if match_key in seen_matches:
+                continue
+            seen_matches.add(match_key)
             pack_size = m.group(1).strip()
             prod_id   = m.group(2).upper()
             qty       = float(m.group(3))
             amt       = float(m.group(4).replace(',', ''))
             totals_qty[prod_id] += qty
             totals_amt[prod_id] += amt
+            # Capture DID (the \w{3,8} group right after product ID)
+            if prod_id not in prod_did:
+                did_m2 = re.search(rf'{re.escape(prod_id)}\s+(\w{{3,8}})\s', m.group(0))
+                if did_m2:
+                    prod_did[prod_id] = did_m2.group(1)
             if prod_id not in prod_pack:
                 prod_pack[prod_id] = pack_size
+            # Extract description (text between PackSize and ProductID) for numeric ID lookup.
+            # pdfplumber sometimes wraps description words to the next line, so we also
+            # grab the line immediately following the match position.
+            if prod_id not in prod_desc and re.match(r'^\d+$', prod_id):
+                dm = re.search(
+                    rf'MONIN\s+{re.escape(pack_size)}\s+(.*?)\s+{re.escape(prod_id)}\b',
+                    m.group(0), re.I | re.S)
+                desc_text = re.sub(r'\s+', ' ', dm.group(1).strip()) if dm else ''
+                # If description is missing or just one very short word, check next line
+                words_found = [w for w in desc_text.split()
+                               if w.upper() not in ('SYRUP','SAUCE','PUREE','MONIN','')]
+                if not words_found:
+                    next_line_m = re.search(
+                        rf'{re.escape(prod_id)}\b[^\n]*\n([A-Z][A-Z ]+?)(?:\s+Cost|\s+\d|\s*$)',
+                        all_text, re.I)
+                    if next_line_m:
+                        desc_text = (desc_text + ' ' + next_line_m.group(1).strip()).strip()
+                if desc_text:
+                    prod_desc[prod_id] = desc_text
 
         # Subtract credit/return lines (qty and amount in parentheses)
+        seen_credits = set()
         for m in credit_pat.finditer(all_text):
+            line_start = all_text.rfind('\n', 0, m.start()) + 1
+            credit_key = all_text[line_start:m.end()][:200]
+            if credit_key in seen_credits:
+                continue
+            seen_credits.add(credit_key)
             prod_id = m.group(2).upper()
             qty     = float(m.group(3))
             amt     = float(m.group(4).replace(',', ''))
@@ -2098,19 +2172,31 @@ def parse_sw_pdf(filepath, cfg, customer_ref, source_override=''):
         if not totals_qty:
             return [{'_error': 'S&W PDF: no product rows found — format may have changed'}]
 
+        # Resolve numeric product IDs to M-codes, then aggregate to avoid duplicates
+        # (multiple numeric IDs can resolve to the same M-code)
+        resolved_qty = defaultdict(float)
+        resolved_amt = defaultdict(float)
+        resolved_pack = {}
         for prod_id in totals_qty:
-            # For numeric IDs, try to find the real Monin item code via description lookup
             item_code = prod_id
             if re.match(r'^\d+$', prod_id):
-                pack_size = prod_pack.get(prod_id, '')
-                # Try to extract flavor description from text near this product ID
-                flavor_m = re.search(
-                    rf'{prod_id}\s+\d{{4,6}}CS\s+\d{{10,14}}\s+[\d.]+\s+[\d.]+\s+BB\s+To.*?\n([A-Z][A-Z ]+)',
-                    all_text, re.I)
-                flavor = flavor_m.group(1).strip() if flavor_m else ''
-                looked_up = lookup_item_code(flavor, pack_size) if flavor else None
-                if looked_up:
-                    item_code = looked_up
+                # 1. DID map (explicit, most accurate — used for Christ Panos etc.)
+                did_val = prod_did.get(prod_id, '')
+                if did_val and did_val in did_map:
+                    item_code = did_map[did_val]
+                else:
+                    # 2. Description-based lookup (fallback for other numeric-ID distributors)
+                    pack_size = prod_pack.get(prod_id, '')
+                    flavor    = prod_desc.get(prod_id, '')
+                    looked_up = lookup_item_code(flavor, pack_size) if flavor else None
+                    if looked_up:
+                        item_code = looked_up
+            resolved_qty[item_code] += totals_qty[prod_id]
+            resolved_amt[item_code] += totals_amt[prod_id]
+            if item_code not in resolved_pack:
+                resolved_pack[item_code] = prod_pack.get(prod_id, '')
+
+        for item_code in resolved_qty:
             rows.append(make_row(
                 source=source_name,
                 program_num=cfg['program_num'],
@@ -2120,8 +2206,8 @@ def parse_sw_pdf(filepath, cfg, customer_ref, source_override=''):
                 start_date=start_date,
                 end_date=end_date,
                 item=item_code,
-                qty=round(totals_qty[prod_id], 4),
-                amount=round(totals_amt[prod_id], 2),
+                qty=round(resolved_qty[item_code], 4),
+                amount=round(resolved_amt[item_code], 2),
                 trade=cfg['trade']
             ))
         # Warn about processing fees (no M-code — can't go into Tellus automatically)
@@ -3232,6 +3318,9 @@ def detect_and_parse(filepath, user_config=None, customer_ref='', file_override=
     elif supplier == 'TANKERSLEY':
         # Tankersley uses the same Trackmax PDF format — route through content-based dispatcher
         return _ret(supplier, parse_supplier_billback_pdf(filepath, cfg, customer_ref))
+    elif supplier == 'CHRIST_PANOS':
+        # Christ Panos uses Trackmax % of FOB format; cfg carries did_map for M-code resolution
+        return _ret(supplier, parse_supplier_billback_pdf(filepath, cfg, customer_ref))
     elif supplier == 'LABATT':
         return _ret(supplier, parse_labatt(filepath, cfg, customer_ref))
     elif supplier == 'HARBOR':
@@ -3415,7 +3504,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 </div>
 
 <script>
-const SUPPLIERS = ['KAST','SOFO','PFS','LABATT','Y_HATA','BEK','NICH_CO','SHAMROCK','DOT_CBBB','MCLANE','S_AND_W','CHENEY','HARBOR','MARTIN_BROS','DOT_FOODS_BB','DRISCOLL','TANKERSLEY'];
+const SUPPLIERS = ['KAST','SOFO','PFS','LABATT','Y_HATA','BEK','NICH_CO','SHAMROCK','DOT_CBBB','MCLANE','S_AND_W','CHENEY','HARBOR','MARTIN_BROS','DOT_FOODS_BB','DRISCOLL','TANKERSLEY','CHRIST_PANOS'];
 const DEFAULT_CFG = {
   KAST:    {program_num:'1004089', dist_id:'134810000', trade:'D'},
   SOFO:    {program_num:'', dist_id:'', trade:'D'},
@@ -3434,6 +3523,7 @@ const DEFAULT_CFG = {
   DOT_FOODS_BB: {program_num:'', dist_id:'', trade:'D'},
   DRISCOLL:     {program_num:'', dist_id:'', trade:'D'},
   TANKERSLEY:   {program_num:'', dist_id:'', trade:'D'},
+  CHRIST_PANOS: {program_num:'', dist_id:'', trade:'D'},
 };
 
 // ── Config persistence (localStorage) ────────────────────────────────────────
@@ -3578,6 +3668,7 @@ function detectSupplier(filename) {
   if (fn.includes('NICH'))    return 'NICH_CO';
   if (fn.includes('CBBB'))    return 'DOT_CBBB';
   if (fn.includes('TANKERSLEY')) return 'TANKERSLEY';
+  if (/CHRIST.*PANOS|PANOS.*CHRIST/.test(fn)) return 'CHRIST_PANOS';
   if (/Y[\s.]?HATA|Y_HATA/.test(fn)) return 'Y_HATA';
   if (fn.includes('DRISCOLL')) return 'DRISCOLL';
   if (fn.includes('HARBOR') || fn.includes('SUPPLIER BILLBACK') || fn.includes('SUPPLIER_BILLBACK')) return 'HARBOR';
@@ -3617,7 +3708,7 @@ const KEY_TO_DISPLAY = {
   Y_HATA:'Y Hata', BEK:'BEK', NICH_CO:'Nicholas&Co', SHAMROCK:'SHAMROCK',
   DOT_CBBB:'DOT', MCLANE:'McLane FS', S_AND_W:'S&W', CHENEY:'Cheney Brothers',
   HARBOR:'Harbor', MARTIN_BROS:'Martin Bros',
-  DOT_FOODS_BB:'DOT', DRISCOLL:'Driscoll Foods', TANKERSLEY:'Tankersley',
+  DOT_FOODS_BB:'DOT', DRISCOLL:'Driscoll Foods', TANKERSLEY:'Tankersley', CHRIST_PANOS:'Christ Panos',
   BLAIR_CANDY:'Blair Candy', UNKNOWN:''
 };
 
