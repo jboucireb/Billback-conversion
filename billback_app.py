@@ -1718,6 +1718,19 @@ DEFAULT_SUPPLIER_CONFIG = {
             '300509': 'M-FR136F',
         }
     },
+    'HENRY_FOODS':  {'program_num': '',        'dist_id': '',           'trade': 'D',
+        'did_map': {
+            '1282177': 'P585',
+            '1282193': 'P240',
+            '1454826': 'M-AR009A',
+            '1454867': 'M-AR063A',
+            '1454909': 'M-AR045A',
+            '1454925': 'M-AR023A',
+            '1454928': 'M-AR084A',
+            '1454933': 'M-AO157B',
+            '1454982': 'M-AS009A',
+        }
+    },
     'UNKNOWN':      {'program_num': '',        'dist_id': '',           'trade': 'D'},
 }
 
@@ -1827,6 +1840,7 @@ def detect_supplier(filename):
     if 'CBBB' in fn: return 'DOT_CBBB'
     if 'TANKERSLEY' in fn: return 'TANKERSLEY'
     if re.search(r'CHRIST.*PANOS|PANOS.*CHRIST', fn): return 'CHRIST_PANOS'
+    if re.search(r"HENRY.{0,4}FOOD|PURCHASE.DETAIL", fn): return 'HENRY_FOODS'
     if re.search(r'Y[\s.]?HATA|Y_HATA|TM\s+\d{6}', fn): return 'Y_HATA'
     if 'DRISCOLL' in fn: return 'DRISCOLL'
     if 'HARBOR' in fn: return 'HARBOR'
@@ -2837,6 +2851,114 @@ def parse_driscoll(filepath, cfg, customer_ref):
     return parse_trackmax(filepath, cfg, customer_ref, source_name='Driscoll Foods')
 
 
+def parse_henrys_foods(filepath, cfg, customer_ref):
+    """Henry's Foods Trackmax PDF — uses '1-NNN ML' pack size format and 5-6 digit numeric product IDs.
+    Columns: InvNum PO# InvDate RcvdDate SupplierName Brand PackSize Description ProductID DID UPC Qty Weight FOB DEL Rate AmtDue
+    Resolves numeric product IDs to M-codes via did_map in supplier config.
+    """
+    rows = []
+    try:
+        with pdfplumber.open(filepath) as pdf:
+            all_text = '\n'.join(page.extract_text() or '' for page in pdf.pages)
+
+        # Dates
+        bill_date = start_date = end_date = ''
+        m = re.search(r'(?:generated|posted)\s+on\s+(\d{1,2}/\d{1,2}/\d{4})', all_text, re.I)
+        if m: bill_date = to_yyyymmdd(m.group(1))
+        m = re.search(r'between\s+(\d{1,2}/\d{1,2}/\d{4})\s+and\s+(\d{1,2}/\d{1,2}/\d{4})', all_text, re.I)
+        if m: start_date, end_date = to_yyyymmdd(m.group(1)), to_yyyymmdd(m.group(2))
+        if not start_date:
+            m2 = re.search(r'Start\s+Date[:\s]+(\d{1,2}/\d{1,2}/\d{4}).*?Stop\s+Date[:\s]+(\d{1,2}/\d{1,2}/\d{4})', all_text, re.I | re.S)
+            if m2: start_date, end_date = to_yyyymmdd(m2.group(1)), to_yyyymmdd(m2.group(2))
+
+        # Invoice ref and source name
+        inv_num = ''
+        m = re.search(r'Invoice\s+Number[:\s]+(\d+)', all_text, re.I)
+        if m: inv_num = m.group(1).strip()
+        cref = customer_ref or inv_num
+
+        source_name = "Henry's Foods"
+        m2 = re.search(r'IMPORTANT!\s*\n([^\n]+)', all_text)
+        if m2: source_name = m2.group(1).strip()
+
+        # Line pattern for Henry's Foods '1-NNN ML' pack size format.
+        # Format: MONIN 1-750 ML CARAMEL SYRUP 399109 1454826 738337006814 24.00 81.50 $142.25 $142.24 1.00 % of Del $1.42
+        line_pat = re.compile(
+            r'MONIN\s+(\d+-\S+(?:\s+(?:ML|LT|CT|RACK|OZ|EA))?)\s+'  # PackSize: 1-750 ML, 1-RACK, 1-1 CT
+            r'(?:\S+\s+)*?'                     # Description words (non-greedy)
+            r'(\d{5,6})\s+'                     # Product ID (5-6 digit numeric)
+            r'(\d{3,9})\s+'                     # DID
+            r'(?:\d{6,18}\s+)?'                 # UPC optional (6-18 digits)
+            r'(\d[\d,]*\.?\d*)\s+'              # Quantity
+            r'[\d,.]+\s+'                       # Total Weight
+            r'(?:\$[\d,.]+\s+){0,2}'            # 0-2 pre-amounts (FOB + DEL)
+            r'[\d.]+\s*%\s+of\s+Del(?:Charges)?\s+'  # Rate: X.XX % of Del
+            r'\$([\d,.]+)',                     # Amount Due
+            re.I
+        )
+
+        did_map = cfg.get('did_map', {})
+        from collections import defaultdict
+        totals_qty = defaultdict(float)
+        totals_amt = defaultdict(float)
+        prod_pack  = {}
+        prod_did   = {}
+        seen_matches = set()
+
+        for m in line_pat.finditer(all_text):
+            line_start = all_text.rfind('\n', 0, m.start()) + 1
+            match_key  = all_text[line_start:m.end()][:200]
+            if match_key in seen_matches:
+                continue
+            seen_matches.add(match_key)
+            pack_size = m.group(1).strip()
+            prod_id   = m.group(2)
+            did_val   = m.group(3)
+            qty       = float(m.group(4).replace(',', ''))
+            amt       = float(m.group(5).replace(',', ''))
+            totals_qty[prod_id] += qty
+            totals_amt[prod_id] += amt
+            if prod_id not in prod_pack:
+                prod_pack[prod_id] = pack_size
+            if prod_id not in prod_did:
+                prod_did[prod_id] = did_val
+
+        # Resolve numeric product IDs → M-codes via DID map
+        resolved_qty  = defaultdict(float)
+        resolved_amt  = defaultdict(float)
+        resolved_pack = {}
+        for prod_id in totals_qty:
+            item_code = prod_id
+            did_val   = prod_did.get(prod_id, '')
+            if did_val and did_val in did_map:
+                item_code = did_map[did_val]
+            resolved_qty[item_code]  += totals_qty[prod_id]
+            resolved_amt[item_code]  += totals_amt[prod_id]
+            if item_code not in resolved_pack:
+                resolved_pack[item_code] = prod_pack.get(prod_id, '')
+
+        for item_code in resolved_qty:
+            rows.append(make_row(
+                source=source_name,
+                program_num=cfg['program_num'],
+                customer_ref=cref,
+                dist_id=cfg['dist_id'],
+                bill_date=bill_date,
+                start_date=start_date,
+                end_date=end_date,
+                item=item_code,
+                qty=resolved_qty[item_code],
+                amount=resolved_amt[item_code],
+                trade=cfg['trade']
+            ))
+
+        if not rows:
+            rows.append({'_error': "Henry's Foods PDF: no product rows found"})
+    except Exception as e:
+        rows.append({'_error': f"Henry's Foods parser: {e}"})
+    return rows
+
+
 def parse_martin_bros(filepath, cfg, customer_ref):
     """Martin Bros. Dist. Co. 'Supplier Billback' PDF format.
     Columns: InvNum PO# InvDate RcvdDate Supplier Brand PackSize Desc M-CODE DID UPC Qty FOB $DEL $DEL %program $Amount
@@ -3326,6 +3448,8 @@ def detect_and_parse(filepath, user_config=None, customer_ref='', file_override=
     elif supplier == 'CHRIST_PANOS':
         # Christ Panos uses Trackmax % of FOB format; cfg carries did_map for M-code resolution
         return _ret(supplier, parse_supplier_billback_pdf(filepath, cfg, customer_ref))
+    elif supplier == 'HENRY_FOODS':
+        return _ret(supplier, parse_henrys_foods(filepath, cfg, customer_ref))
     elif supplier == 'LABATT':
         return _ret(supplier, parse_labatt(filepath, cfg, customer_ref))
     elif supplier == 'HARBOR':
@@ -3509,7 +3633,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 </div>
 
 <script>
-const SUPPLIERS = ['KAST','SOFO','PFS','LABATT','Y_HATA','BEK','NICH_CO','SHAMROCK','DOT_CBBB','MCLANE','S_AND_W','CHENEY','HARBOR','MARTIN_BROS','DOT_FOODS_BB','DRISCOLL','TANKERSLEY','CHRIST_PANOS'];
+const SUPPLIERS = ['KAST','SOFO','PFS','LABATT','Y_HATA','BEK','NICH_CO','SHAMROCK','DOT_CBBB','MCLANE','S_AND_W','CHENEY','HARBOR','MARTIN_BROS','DOT_FOODS_BB','DRISCOLL','TANKERSLEY','CHRIST_PANOS','HENRY_FOODS'];
 const DEFAULT_CFG = {
   KAST:    {program_num:'1004089', dist_id:'134810000', trade:'D'},
   SOFO:    {program_num:'', dist_id:'', trade:'D'},
@@ -3529,6 +3653,7 @@ const DEFAULT_CFG = {
   DRISCOLL:     {program_num:'', dist_id:'', trade:'D'},
   TANKERSLEY:   {program_num:'', dist_id:'', trade:'D'},
   CHRIST_PANOS: {program_num:'', dist_id:'', trade:'D'},
+  HENRY_FOODS:  {program_num:'', dist_id:'', trade:'D'},
 };
 
 // ── Config persistence (localStorage) ────────────────────────────────────────
@@ -3674,6 +3799,7 @@ function detectSupplier(filename) {
   if (fn.includes('CBBB'))    return 'DOT_CBBB';
   if (fn.includes('TANKERSLEY')) return 'TANKERSLEY';
   if (/CHRIST.*PANOS|PANOS.*CHRIST/.test(fn)) return 'CHRIST_PANOS';
+  if (/HENRY.{0,4}FOOD|PURCHASE.DETAIL/.test(fn)) return 'HENRY_FOODS';
   if (/Y[\s.]?HATA|Y_HATA/.test(fn)) return 'Y_HATA';
   if (fn.includes('DRISCOLL')) return 'DRISCOLL';
   if (fn.includes('HARBOR') || fn.includes('SUPPLIER BILLBACK') || fn.includes('SUPPLIER_BILLBACK')) return 'HARBOR';
@@ -3714,6 +3840,7 @@ const KEY_TO_DISPLAY = {
   DOT_CBBB:'DOT', MCLANE:'McLane FS', S_AND_W:'S&W', CHENEY:'Cheney Brothers',
   HARBOR:'Harbor', MARTIN_BROS:'Martin Bros',
   DOT_FOODS_BB:'DOT', DRISCOLL:'Driscoll Foods', TANKERSLEY:'Tankersley', CHRIST_PANOS:'Christ Panos',
+  HENRY_FOODS:"Henry's Foods",
   BLAIR_CANDY:'Blair Candy', UNKNOWN:''
 };
 
