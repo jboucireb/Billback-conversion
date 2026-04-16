@@ -1731,6 +1731,7 @@ DEFAULT_SUPPLIER_CONFIG = {
             '1454982': 'M-AS009A',
         }
     },
+    'DELCO_FOODS':  {'program_num': '',        'dist_id': '',           'trade': 'D'},
     'UNKNOWN':      {'program_num': '',        'dist_id': '',           'trade': 'D'},
 }
 
@@ -1841,6 +1842,7 @@ def detect_supplier(filename):
     if 'TANKERSLEY' in fn: return 'TANKERSLEY'
     if re.search(r'CHRIST.*PANOS|PANOS.*CHRIST', fn): return 'CHRIST_PANOS'
     if re.search(r"HENRY.{0,4}FOOD|PURCHASE.DETAIL", fn): return 'HENRY_FOODS'
+    if 'DELCO' in fn: return 'DELCO_FOODS'
     if re.search(r'Y[\s.]?HATA|Y_HATA|TM\s+\d{6}', fn): return 'Y_HATA'
     if 'DRISCOLL' in fn: return 'DRISCOLL'
     if 'HARBOR' in fn: return 'HARBOR'
@@ -2959,6 +2961,106 @@ def parse_henrys_foods(filepath, cfg, customer_ref):
     return rows
 
 
+def parse_delco_foods(filepath, cfg, customer_ref):
+    """Delco Foods 'Supplier Billback' Trackmax PDF.
+    Columns: InvNum PO# InvDate Rcvd SupplierName Brand PackSize Description ProductID DID Qty Total FOB DEL Rate Amount
+    M-codes appear directly as Product ID; DID format is XXXXXXXXCAS (10 alphanumeric chars).
+    Rate: 4.00 % of FOB with two identical dollar columns (FOB + DEL).
+    """
+    rows = []
+    try:
+        with pdfplumber.open(filepath) as pdf:
+            all_text = '\n'.join(page.extract_text() or '' for page in pdf.pages)
+
+        # Statement / bill date
+        bill_date = start_date = end_date = ''
+        m = re.search(r'generated\s+on\s+(\d{1,2}/\d{1,2}/\d{4})', all_text, re.I)
+        if m: bill_date = to_yyyymmdd(m.group(1))
+
+        # Program date range
+        m = re.search(r'between\s+(\d{1,2}/\d{1,2}/\d{4})\s+and\s+(\d{1,2}/\d{1,2}/\d{4})', all_text, re.I)
+        if m: start_date, end_date = to_yyyymmdd(m.group(1)), to_yyyymmdd(m.group(2))
+        if not start_date:
+            m2 = re.search(r'Start\s+Date[:\s]+(\d{1,2}/\d{1,2}/\d{4}).*?Stop\s+Date[:\s]+(\d{1,2}/\d{1,2}/\d{4})', all_text, re.I | re.S)
+            if m2: start_date, end_date = to_yyyymmdd(m2.group(1)), to_yyyymmdd(m2.group(2))
+
+        # Invoice number
+        inv_num = ''
+        m = re.search(r'Our\s+Invoice\s+Number[:\s]+(\w+)', all_text, re.I)
+        if not m:
+            m = re.search(r'Invoice\s+Number[:\s]+(\w+)', all_text, re.I)
+        if m: inv_num = m.group(1).strip()
+        cref = customer_ref or inv_num
+
+        source_name = 'Delco Foods'
+
+        # Line pattern:
+        # MONIN PackSize Description M-code DID Qty Weight $FOB $DEL Rate% $Amount
+        # PackSize examples: 12/750  4/1.89  6/12 OZ  4/1 LTR  4/1 L  1/each  6/12OZ  12/750 ml
+        # DID examples: 1002081CAS  1004006CAS  1002428EAC  (10 alphanumeric chars)
+        line_pat = re.compile(
+            r'MONIN\s+'
+            r'\S+\s+'                                    # PackSize main token (unit may be on next line)
+            r'.+?\s+'                                    # Description words (lazy, no dotall — won't cross newlines)
+            r'(M-[A-Z][A-Z0-9]+|P\d{3,4})\s+'          # Product ID (M-code like M-AR045A or P-code like P240)
+            r'\w{6,12}\s+'                              # DID (e.g., 1002081CAS)
+            r'(\d[\d,]*\.?\d*)\s+'                      # Quantity
+            r'[\d,.]+\s+'                               # Total weight
+            r'\$[\d,]+\.?\d*\s+'                        # FOB amount
+            r'\$[\d,]+\.?\d*\s+'                        # DEL amount
+            r'[\d.]+\s*%\s+of\s+FOB\s+'                # Rate (4.00 % of FOB)
+            r'\$([\d,]+\.?\d*)',                        # Amount Due
+            re.I
+        )
+
+        from collections import defaultdict
+        totals_qty = defaultdict(float)
+        totals_amt = defaultdict(float)
+        seen_matches = set()
+
+        for m in line_pat.finditer(all_text):
+            # Deduplicate lines that appear on page-boundary continuations
+            line_start = all_text.rfind('\n', 0, m.start()) + 1
+            match_key  = all_text[line_start:m.end()][:200]
+            if match_key in seen_matches:
+                continue
+            seen_matches.add(match_key)
+
+            item = m.group(1).upper()
+            # Fix OCR artifact: pdfplumber sometimes reads '0' as 'O' in the 3-digit
+            # numeric section of M-codes (e.g., M-ARO10A → M-AR010A, M-ARO42A → M-AR042A).
+            # Pattern M-XX\d\d\dY — only replace O→0 inside the 3-char numeric block.
+            ocr_fix = re.match(r'(M-[A-Z]{2})([A-Z0-9]{3})([A-Z].*)$', item)
+            if ocr_fix:
+                item = ocr_fix.group(1) + ocr_fix.group(2).replace('O', '0') + ocr_fix.group(3)
+
+            qty = float(m.group(2).replace(',', ''))
+            amt = float(m.group(3).replace(',', ''))
+            totals_qty[item] += qty
+            totals_amt[item] += amt
+
+        for item in sorted(totals_qty):
+            rows.append(make_row(
+                source=source_name,
+                program_num=cfg['program_num'],
+                customer_ref=cref,
+                dist_id=cfg['dist_id'],
+                bill_date=bill_date,
+                start_date=start_date,
+                end_date=end_date,
+                item=item,
+                qty=totals_qty[item],
+                amount=totals_amt[item],
+                trade=cfg['trade']
+            ))
+
+        if not rows:
+            rows.append({'_error': 'Delco Foods PDF: no product rows found'})
+    except Exception as e:
+        rows.append({'_error': f'Delco Foods parser: {e}'})
+    return rows
+
+
 def parse_martin_bros(filepath, cfg, customer_ref):
     """Martin Bros. Dist. Co. 'Supplier Billback' PDF format.
     Columns: InvNum PO# InvDate RcvdDate Supplier Brand PackSize Desc M-CODE DID UPC Qty FOB $DEL $DEL %program $Amount
@@ -3144,6 +3246,8 @@ def parse_supplier_billback_pdf(filepath, cfg, customer_ref):
         return parse_martin_bros(filepath, cfg, customer_ref)
     if 'Driscoll Foods' in first_page:
         return parse_trackmax(filepath, cfg, customer_ref, source_name='Driscoll Foods')
+    if 'Delco Foods' in first_page:
+        return parse_delco_foods(filepath, cfg, customer_ref)
     # S&W Trackmax PDF — uses numeric product IDs instead of M-codes
     if 'S&W Wholesale' in first_page or 's-wfoods' in first_page.lower():
         return parse_sw_pdf(filepath, cfg, customer_ref)
@@ -3450,6 +3554,8 @@ def detect_and_parse(filepath, user_config=None, customer_ref='', file_override=
         return _ret(supplier, parse_supplier_billback_pdf(filepath, cfg, customer_ref))
     elif supplier == 'HENRY_FOODS':
         return _ret(supplier, parse_henrys_foods(filepath, cfg, customer_ref))
+    elif supplier == 'DELCO_FOODS':
+        return _ret(supplier, parse_delco_foods(filepath, cfg, customer_ref))
     elif supplier == 'LABATT':
         return _ret(supplier, parse_labatt(filepath, cfg, customer_ref))
     elif supplier == 'HARBOR':
@@ -3461,6 +3567,8 @@ def detect_and_parse(filepath, user_config=None, customer_ref='', file_override=
                 return _ret('MARTIN_BROS', result)
             if src == 'Driscoll Foods':
                 return _ret('DRISCOLL', result)
+            if src == 'Delco Foods':
+                return _ret('DELCO_FOODS', result)
         return _ret(supplier, result)
     elif supplier == 'MARTIN_BROS':
         return _ret(supplier, parse_martin_bros(filepath, cfg, customer_ref))
@@ -3633,7 +3741,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 </div>
 
 <script>
-const SUPPLIERS = ['KAST','SOFO','PFS','LABATT','Y_HATA','BEK','NICH_CO','SHAMROCK','DOT_CBBB','MCLANE','S_AND_W','CHENEY','HARBOR','MARTIN_BROS','DOT_FOODS_BB','DRISCOLL','TANKERSLEY','CHRIST_PANOS','HENRY_FOODS'];
+const SUPPLIERS = ['KAST','SOFO','PFS','LABATT','Y_HATA','BEK','NICH_CO','SHAMROCK','DOT_CBBB','MCLANE','S_AND_W','CHENEY','HARBOR','MARTIN_BROS','DOT_FOODS_BB','DRISCOLL','TANKERSLEY','CHRIST_PANOS','HENRY_FOODS','DELCO_FOODS'];
 const DEFAULT_CFG = {
   KAST:    {program_num:'1004089', dist_id:'134810000', trade:'D'},
   SOFO:    {program_num:'', dist_id:'', trade:'D'},
@@ -3654,6 +3762,7 @@ const DEFAULT_CFG = {
   TANKERSLEY:   {program_num:'', dist_id:'', trade:'D'},
   CHRIST_PANOS: {program_num:'', dist_id:'', trade:'D'},
   HENRY_FOODS:  {program_num:'', dist_id:'', trade:'D'},
+  DELCO_FOODS:  {program_num:'', dist_id:'', trade:'D'},
 };
 
 // ── Config persistence (localStorage) ────────────────────────────────────────
@@ -3800,8 +3909,10 @@ function detectSupplier(filename) {
   if (fn.includes('TANKERSLEY')) return 'TANKERSLEY';
   if (/CHRIST.*PANOS|PANOS.*CHRIST/.test(fn)) return 'CHRIST_PANOS';
   if (/HENRY.{0,4}FOOD|PURCHASE.DETAIL/.test(fn)) return 'HENRY_FOODS';
+  if (fn.includes('DELCO')) return 'DELCO_FOODS';
   if (/Y[\s.]?HATA|Y_HATA/.test(fn)) return 'Y_HATA';
   if (fn.includes('DRISCOLL')) return 'DRISCOLL';
+  if (fn.includes('DELCO')) return 'DELCO_FOODS';
   if (fn.includes('HARBOR') || fn.includes('SUPPLIER BILLBACK') || fn.includes('SUPPLIER_BILLBACK')) return 'HARBOR';
   return 'UNKNOWN';
 }
@@ -3829,6 +3940,7 @@ function distNameToKey(name) {
   if (u.includes('DRISCOLL')) return 'DRISCOLL';
   if (u.includes('HARBOR')) return 'HARBOR';
   if (u.includes('CHENEY')) return 'CHENEY';
+  if (u.includes('DELCO')) return 'DELCO_FOODS';
   // Everything else: route through content-based PDF dispatcher (don't force Harbor)
   return 'UNKNOWN';
 }
@@ -3841,6 +3953,7 @@ const KEY_TO_DISPLAY = {
   HARBOR:'Harbor', MARTIN_BROS:'Martin Bros',
   DOT_FOODS_BB:'DOT', DRISCOLL:'Driscoll Foods', TANKERSLEY:'Tankersley', CHRIST_PANOS:'Christ Panos',
   HENRY_FOODS:"Henry's Foods",
+  DELCO_FOODS:'Delco Foods',
   BLAIR_CANDY:'Blair Candy', UNKNOWN:''
 };
 
