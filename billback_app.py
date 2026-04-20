@@ -3168,13 +3168,20 @@ def parse_chefs_warehouse(filepath, cfg, customer_ref):
 
 def parse_martin_bros(filepath, cfg, customer_ref):
     """Martin Bros. Dist. Co. 'Supplier Billback' PDF format.
-    Columns: InvNum PO# InvDate RcvdDate Supplier Brand PackSize Desc M-CODE DID UPC Qty FOB $DEL $DEL %program $Amount
+    Columns: InvNum [PO#] InvDate [Rcvd] Supplier Brand PackSize Desc M-CODE DID UPC Qty
+             Weight $Charges [$DEL] Rate $Amount
     M-code is Product ID; billback amount is last $X.XX on the line.
+    Rate is either a percentage (e.g. "6.00% of Del Cost") or per-unit (e.g. "BB To 41.410/unit").
+    Page-boundary dedup: Martin Bros PDFs sometimes repeat the last line of page N at the top
+    of page N+1. Detect this by processing pages individually and skipping the first data line
+    of a page when it exactly matches the last data line of the previous page.
+    Legitimate within-page duplicates (same item invoiced twice on one page) are preserved.
     """
     rows = []
     try:
         with pdfplumber.open(filepath) as pdf:
-            all_text = '\n'.join(page.extract_text() or '' for page in pdf.pages)
+            pages_text = [page.extract_text() or '' for page in pdf.pages]
+        all_text = '\n'.join(pages_text)
 
         # Statement date and program date range
         bill_date = start_date = end_date = ''
@@ -3193,39 +3200,59 @@ def parse_martin_bros(filepath, cfg, customer_ref):
         if m2: inv_num = m2.group(1).strip()
         cref = customer_ref or inv_num
 
-        # Each data line: ... M-CODE  DID(8-9d)  UPC(12-14d)  QTY  FOB  $DEL  $DEL  X%...  $AMOUNT
-        # After M-code: short DID, long UPC, then qty as float
+        # Each data line: ... M-CODE  DID(5-9d)  UPC(10-14d)  QTY  Weight  $Charges  [$DEL]  Rate  $Amount
+        # Rate is either a percentage (e.g. "6.00%") or a per-unit amount (e.g. "BB To 41.410/unit")
+        # The second dollar column (DEL) is optional depending on the invoice format.
         line_pat = re.compile(
-            r'([A-Z]-[A-Z0-9]+)\s+\d{5,9}\s+\d{10,14}\s+([\d.]+)\s+[\d.]+\s+\$([\d,.]+)\s+\$([\d,.]+)\s+[\d.]+%.*?\$([\d,.]+)',
+            r'([A-Z]-[A-Z0-9]+)\s+'         # M-code (group 1)
+            r'\d{5,9}\s+'                    # DID
+            r'\d{10,14}\s+'                  # UPC
+            r'([\d.]+)\s+'                   # Qty (group 2)
+            r'[\d.]+\s+'                     # Weight
+            r'\$([\d,.]+)'                   # Total charges / FOB (group 3)
+            r'(?:\s+\$([\d,.]+))?'           # Optional 2nd $ column / DEL (group 4)
+            r'\s+(?:[\d.]+\s*%|BB\s+To\s+[\d.]+/\w+)'  # Rate: percentage OR BB To X/unit
+            r'.*?\$([\d,.]+)',               # Amount Due — last $ on the line (group 5)
             re.I
         )
-        seen_lines = set()   # deduplicate page-boundary carryover lines
-        for line in all_text.splitlines():
-            if re.search(r'^Totals for|^Invoice|Inv\.\s*Number|program activity', line, re.I):
-                continue
-            m = line_pat.search(line)
-            if not m: continue
-            item   = m.group(1).upper()
-            qty    = m.group(2)
-            amount = clean_amount(m.group(5))   # last dollar column = billback amount
-            # Lines at page breaks appear on both the bottom of one page and the top of
-            # the next; deduplicate by exact raw line content
-            if line in seen_lines:
-                continue
-            seen_lines.add(line)
-            rows.append(make_row(
-                source='Martin Bros',
-                program_num=cfg['program_num'],
-                customer_ref=cref,
-                dist_id=cfg['dist_id'],
-                bill_date=bill_date,
-                start_date=start_date,
-                end_date=end_date,
-                item=item,
-                qty=qty,
-                amount=amount,
-                trade=cfg['trade']
-            ))
+
+        skip_filter = re.compile(r'^Totals for|^Invoice|Inv\.\s*Number|program activity', re.I)
+
+        def _data_lines(page_text):
+            """Return only matchable data lines from a page, in order."""
+            result = []
+            for ln in page_text.splitlines():
+                if skip_filter.search(ln): continue
+                if line_pat.search(ln): result.append(ln)
+            return result
+
+        prev_last_line = None   # last data line of the previous page
+        for page_text in pages_text:
+            data_lines = _data_lines(page_text)
+            for i, line in enumerate(data_lines):
+                # Skip the first data line of this page if it is an exact repeat of the
+                # last data line of the previous page (page-boundary carryover).
+                if i == 0 and prev_last_line is not None and line == prev_last_line:
+                    continue
+                m = line_pat.search(line)
+                item   = m.group(1).upper()
+                qty    = m.group(2)
+                amount = clean_amount(m.group(5))
+                rows.append(make_row(
+                    source='Martin Bros',
+                    program_num=cfg['program_num'],
+                    customer_ref=cref,
+                    dist_id=cfg['dist_id'],
+                    bill_date=bill_date,
+                    start_date=start_date,
+                    end_date=end_date,
+                    item=item,
+                    qty=qty,
+                    amount=amount,
+                    trade=cfg['trade']
+                ))
+            if data_lines:
+                prev_last_line = data_lines[-1]
         if not rows:
             rows.append({'_error': 'Martin Bros PDF: no rows extracted'})
     except Exception as e:
