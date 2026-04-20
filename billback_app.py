@@ -1793,13 +1793,7 @@ def make_row(source='', program_num='', customer_ref='', dist_id='',
              bill_date='', start_date='', end_date='',
              item='', qty=0, amount=0.0, trade='D', operator_id=''):
     dist_id_raw = str(dist_id).strip()
-    if not dist_id_raw:
-        dist_id_int = None
-    else:
-        try:
-            dist_id_int = int(dist_id_raw)   # keep as int if purely numeric (e.g. 134810000)
-        except ValueError:
-            dist_id_int = dist_id_raw        # keep as string if alphanumeric (e.g. C100035)
+    dist_id_int = dist_id_raw if dist_id_raw else None  # always string — preserves leading zeros
     try:
         qty_int = round(float(str(qty))) if qty not in ('', None) else 0
     except:
@@ -3412,35 +3406,105 @@ def parse_supplier_billback_pdf(filepath, cfg, customer_ref):
         # Harbor sends XLS usually; PDF variant — generic fallback
         return [{'_error': 'Harbor Foodservice PDF format not yet supported — please send the XLSX version'}]
 
-    # Unknown distributor — try generic M-code extraction as best effort
+    # ── Generic Trackmax fallback ────────────────────────────────────────────────
+    # All Trackmax-style PDFs share the same three invariants regardless of
+    # column order, rate format, or distributor name:
+    #   1. Item codes are always in the form  M-XXXXXXX  (or P-codes / numeric)
+    #   2. Large digit-only numbers after the code are DID / UPC — skip them
+    #   3. The last  $X.XX  on each data line is always the billback Amount Due
+    #
+    # This parser reads any unknown Trackmax variant without format-specific code.
+    # Page-boundary dedup (same line printed at bottom of page N and top of page
+    # N+1) is handled by comparing the first data line of each page to the last
+    # data line of the previous page.
     rows = []
     try:
         with pdfplumber.open(filepath) as pdf:
-            all_text = '\n'.join(page.extract_text() or '' for page in pdf.pages)
+            pages_text = [page.extract_text() or '' for page in pdf.pages]
+        all_text = '\n'.join(pages_text)
+
         bill_date = start_date = end_date = ''
-        m = re.search(r'(\d{1,2}/\d{1,2}/\d{4})', all_text)
+        m = re.search(r'generated\s+on\s+(\d{1,2}/\d{1,2}/\d{4})', all_text, re.I)
         if m: bill_date = to_yyyymmdd(m.group(1))
-        s, e = parse_date_range(all_text)
-        if s: start_date, end_date = s, e
-        for line in all_text.splitlines():
-            if re.search(r'total|header|description', line, re.I): continue
-            m = re.search(r'([A-Z]-[A-Z0-9]+).*?([\d.]+)\s+.*?\$([\d,.]+)\s*$', line, re.I)
-            if not m: continue
+        m = re.search(r'between\s+(\d{1,2}/\d{1,2}/\d{4})\s+and\s+(\d{1,2}/\d{1,2}/\d{4})', all_text, re.I)
+        if m: start_date, end_date = to_yyyymmdd(m.group(1)), to_yyyymmdd(m.group(2))
+        if not start_date:
+            m2 = re.search(r'Start\s+Date[:\s]+(\d{1,2}/\d{1,2}/\d{4}).*?Stop\s+Date[:\s]+(\d{1,2}/\d{1,2}/\d{4})', all_text, re.I | re.S)
+            if m2: start_date, end_date = to_yyyymmdd(m2.group(1)), to_yyyymmdd(m2.group(2))
+
+        inv_num = ''
+        m3 = re.search(r'(?:Our\s+)?Invoice\s+Number[:\s]+(\w+)', all_text, re.I)
+        if m3: inv_num = m3.group(1).strip()
+        cref = customer_ref or inv_num
+
+        # Pattern: M-code → skip digit-only IDs → first decimal = qty → last $X.XX = amount
+        code_pat  = re.compile(r'(M-[A-Z][A-Z0-9]+|P\d{3,4})', re.I)
+        # After the code: skip DID/UPC (pure-digit tokens 5+ chars), take first decimal as qty
+        qty_pat   = re.compile(r'(?:\s+\d{5,})*\s+([\d]+\.[\d]+)', re.I)
+        # Last dollar amount on the line
+        amt_pat   = re.compile(r'\$([\d,]+\.[\d]{2})(?![\d])')
+        skip_pat  = re.compile(r'Totals?\s+for|^Invoice|Inv\.?\s*Num|program\s+activity|'
+                                r'Product\s+ID|Description|PackSize|^\s*$', re.I)
+
+        from collections import defaultdict
+        totals_qty = defaultdict(float)
+        totals_amt = defaultdict(float)
+
+        prev_last_line = None
+        for page_text in pages_text:
+            data_lines = []
+            for line in page_text.splitlines():
+                if skip_pat.search(line): continue
+                cm = code_pat.search(line)
+                if not cm: continue
+                # Must have at least one dollar amount on the line
+                if not amt_pat.search(line): continue
+                data_lines.append(line)
+
+            for i, line in enumerate(data_lines):
+                # Skip first line of page if it's an exact repeat of previous page's last line
+                if i == 0 and prev_last_line is not None and line == prev_last_line:
+                    continue
+                cm = code_pat.search(line)
+                item = cm.group(1).upper()
+                # Qty: first decimal after the code, skipping large digit-only IDs
+                after_code = line[cm.end():]
+                qm = qty_pat.match(after_code)
+                qty = float(qm.group(1)) if qm else 1.0
+                # Amount: last $X.XX on the line
+                all_amts = amt_pat.findall(line)
+                if not all_amts: continue
+                amt = float(all_amts[-1].replace(',', ''))
+                totals_qty[item] += qty
+                totals_amt[item] += amt
+
+            if data_lines:
+                prev_last_line = data_lines[-1]
+
+        source_name = 'Dist PDF'
+        # Try to extract a distributor name from the header
+        for hint in ['Martin Bros', 'Driscoll', 'Delco', 'Cheney', 'SOFO', 'BEK']:
+            if hint.lower() in all_text.lower():
+                source_name = hint
+                break
+
+        for item in sorted(totals_qty):
             rows.append(make_row(
-                source='Dist PDF',
+                source=source_name,
                 program_num=cfg['program_num'],
-                customer_ref=customer_ref,
+                customer_ref=cref,
                 dist_id=cfg['dist_id'],
                 bill_date=bill_date,
                 start_date=start_date,
                 end_date=end_date,
-                item=m.group(1).upper(),
-                qty=m.group(2),
-                amount=clean_amount(m.group(3)),
+                item=item,
+                qty=totals_qty[item],
+                amount=totals_amt[item],
                 trade=cfg['trade']
             ))
         if not rows:
-            rows.append({'_error': f'Unknown distributor PDF — could not identify company from content. Please add support for this format.'})
+            rows.append({'_error': 'Could not extract any M-code rows from this PDF — '
+                                   'please verify it is a Trackmax-style billback.'})
     except Exception as e:
         rows.append({'_error': f'Supplier Billback PDF: {e}'})
     return rows
