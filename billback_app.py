@@ -1733,6 +1733,7 @@ DEFAULT_SUPPLIER_CONFIG = {
     },
     'DELCO_FOODS':  {'program_num': '',        'dist_id': '',           'trade': 'D'},
     'CHEFS_WH':     {'program_num': '',        'dist_id': '',           'trade': 'D'},
+    'ATLAS':        {'program_num': '',        'dist_id': '',           'trade': 'D'},
     'UNKNOWN':      {'program_num': '',        'dist_id': '',           'trade': 'D'},
 }
 
@@ -1843,6 +1844,7 @@ def detect_supplier(filename):
     if re.search(r"HENRY.{0,4}FOOD|PURCHASE.DETAIL", fn): return 'HENRY_FOODS'
     if 'DELCO' in fn: return 'DELCO_FOODS'
     if re.search(r'CHEFS.{0,6}WH|CHEFSWAREHOUSE|DAIRYLAND', fn): return 'CHEFS_WH'
+    if re.search(r'ATLAS[\s_]?WHOLESALE|ATLAS[\s_]?FOOD', fn): return 'ATLAS'
     if re.search(r'Y[\s.]?HATA|Y_HATA|TM\s+\d{6}', fn): return 'Y_HATA'
     if 'DRISCOLL' in fn: return 'DRISCOLL'
     if 'HARBOR' in fn: return 'HARBOR'
@@ -3416,6 +3418,8 @@ def parse_supplier_billback_pdf(filepath, cfg, customer_ref):
         return parse_delco_foods(filepath, cfg, customer_ref)
     if 'Dairyland' in first_page or 'The Chefs Warehouse' in first_page or 'ChefsWhse' in first_page:
         return parse_chefs_warehouse(filepath, cfg, customer_ref)
+    if re.search(r'REVENUE\s+TRACKING\s+REPORT', first_page, re.I) and 'MFG#' in first_page:
+        return parse_atlas(filepath, cfg, customer_ref)
     # S&W Trackmax PDF — uses numeric product IDs instead of M-codes
     if 'S&W Wholesale' in first_page or 's-wfoods' in first_page.lower():
         return parse_sw_pdf(filepath, cfg, customer_ref)
@@ -3547,6 +3551,71 @@ def parse_supplier_billback_pdf(filepath, cfg, customer_ref):
                                    'please verify it is a Trackmax-style billback.'})
     except Exception as e:
         rows.append({'_error': f'Supplier Billback PDF: {e}'})
+    return rows
+
+
+def parse_atlas(filepath, cfg, customer_ref):
+    """Atlas Wholesale Food 'Revenue Tracking Report' PDF.
+    Each product has a MFG# subtotal line:
+        MFG# M-XXXXXX  <TotalQty>  <TotalCost>  <Revenue>  [0.00]
+    Revenue (4th number) is the billback amount; TotalQty is the 2nd number.
+    Date range comes from: FROM: MM/DD/YY TO MM/DD/YY
+    """
+    rows = []
+    try:
+        with pdfplumber.open(filepath) as pdf:
+            all_text = '\n'.join(page.extract_text() or '' for page in pdf.pages)
+
+        bill_date = start_date = end_date = ''
+        dr = re.search(r'FROM:\s+(\d{1,2}/\d{1,2}/\d{2,4})\s+TO\s+(\d{1,2}/\d{1,2}/\d{2,4})', all_text, re.I)
+        if dr:
+            start_date = to_yyyymmdd(dr.group(1))
+            end_date   = to_yyyymmdd(dr.group(2))
+            bill_date  = end_date
+
+        inv_num = ''
+        m = re.search(r'DocID[_\s]*([\w-]+)', os.path.basename(filepath), re.I)
+        if m: inv_num = m.group(1).strip()
+        cref = customer_ref or inv_num
+
+        # MFG# subtotal line: M-code  qty  totalcost  revenue
+        mfg_pat = re.compile(
+            r'MFG#\s+(M-[A-Z][A-Z0-9]+)\s+'
+            r'([\d,]+)\s+'        # total qty
+            r'[\d,.]+\s+'         # total cost (skip)
+            r'([\d,.]+)',          # revenue = billback amount
+            re.I
+        )
+
+        from collections import defaultdict
+        totals_qty = defaultdict(float)
+        totals_amt = defaultdict(float)
+
+        for m in mfg_pat.finditer(all_text):
+            item = m.group(1).upper()
+            qty  = float(m.group(2).replace(',', ''))
+            amt  = float(m.group(3).replace(',', ''))
+            totals_qty[item] += qty
+            totals_amt[item] += amt
+
+        for item in sorted(totals_qty):
+            rows.append(make_row(
+                source='Atlas Wholesale',
+                program_num=cfg['program_num'],
+                customer_ref=cref,
+                dist_id=cfg['dist_id'],
+                bill_date=bill_date,
+                start_date=start_date,
+                end_date=end_date,
+                item=item,
+                qty=totals_qty[item],
+                amount=totals_amt[item],
+                trade=cfg['trade']
+            ))
+        if not rows:
+            rows.append({'_error': 'Atlas Wholesale PDF: no MFG# product lines found'})
+    except Exception as e:
+        rows.append({'_error': f'Atlas Wholesale parser: {e}'})
     return rows
 
 
@@ -3796,6 +3865,8 @@ def detect_and_parse(filepath, user_config=None, customer_ref='', file_override=
         return _ret(supplier, parse_delco_foods(filepath, cfg, customer_ref))
     elif supplier == 'CHEFS_WH':
         return _ret(supplier, parse_chefs_warehouse(filepath, cfg, customer_ref))
+    elif supplier == 'ATLAS':
+        return _ret(supplier, parse_atlas(filepath, cfg, customer_ref))
     elif supplier == 'LABATT':
         return _ret(supplier, parse_labatt(filepath, cfg, customer_ref))
     elif supplier == 'HARBOR':
@@ -3811,6 +3882,8 @@ def detect_and_parse(filepath, user_config=None, customer_ref='', file_override=
                 return _ret('DELCO_FOODS', result)
             if src == 'The Chefs Warehouse':
                 return _ret('CHEFS_WH', result)
+            if src == 'Atlas Wholesale Food':
+                return _ret('ATLAS', result)
         return _ret(supplier, result)
     elif supplier == 'MARTIN_BROS':
         return _ret(supplier, parse_martin_bros(filepath, cfg, customer_ref))
@@ -4154,6 +4227,7 @@ function detectSupplier(filename) {
   if (/HENRY.{0,4}FOOD|PURCHASE.DETAIL/.test(fn)) return 'HENRY_FOODS';
   if (fn.includes('DELCO')) return 'DELCO_FOODS';
   if (/CHEFS.{0,6}WH|CHEFSWAREHOUSE|DAIRYLAND/.test(fn)) return 'CHEFS_WH';
+  if (/ATLAS[\s_]?WHOLESALE|ATLAS[\s_]?FOOD/.test(fn)) return 'ATLAS';
   if (/Y[\s.]?HATA|Y_HATA/.test(fn)) return 'Y_HATA';
   if (fn.includes('DRISCOLL')) return 'DRISCOLL';
   if (fn.includes('DELCO')) return 'DELCO_FOODS';
@@ -4187,6 +4261,7 @@ function distNameToKey(name) {
   if (u.includes('CHENEY')) return 'CHENEY';
   if (u.includes('DELCO')) return 'DELCO_FOODS';
   if (u.includes('CHEFSWAREHOUSE') || u.includes('CHEFSWHSE') || u.includes('DAIRYLAND') || u.includes('CHEFSW')) return 'CHEFS_WH';
+  if (u.includes('ATLAS')) return 'ATLAS';
   // Everything else: route through content-based PDF dispatcher (don't force Harbor)
   return 'UNKNOWN';
 }
@@ -4201,6 +4276,7 @@ const KEY_TO_DISPLAY = {
   HENRY_FOODS:"Henry's Foods",
   DELCO_FOODS:'Delco Foods',
   CHEFS_WH:'The Chefs Warehouse',
+  ATLAS:'Atlas Wholesale Food',
   BLAIR_CANDY:'Blair Candy', UNKNOWN:''
 };
 
