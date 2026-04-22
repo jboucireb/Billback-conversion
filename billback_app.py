@@ -2635,25 +2635,65 @@ def parse_pfs(filepath, cfg, customer_ref):
     if filepath.lower().endswith('.pdf'):
         # PFS Roma uses Powered-by-Trackmax format; route through the generic Trackmax parser.
         return parse_trackmax(filepath, cfg, customer_ref, source_name='PFS')
-    # Non-PDF fallback (CSV/XLSX) — generic M-code search
+    # Non-PDF (CSV/XLSX) — PFS BidRRpt format
+    # Columns: Distribution Center | Vendor# | Vendor Name | Date From | Date Thru |
+    #          Total Due | Bid | Bid Description | Item | Pack | Size | Description |
+    #          UPC | Vendor Item# | Contract ID | Qty | Each | Allowance | Extended Amt
     rows = []
     try:
         import pandas as pd
         df = pd.read_csv(filepath, dtype=str) if filepath.lower().endswith('.csv') else pd.read_excel(filepath, dtype=str)
+        df.columns = [c.strip() for c in df.columns]
+
+        # Locate key columns (case-insensitive, strip whitespace)
+        col_map = {c.strip().lower(): c for c in df.columns}
+        def col(name): return col_map.get(name.lower())
+
+        mcode_col  = col('Vendor Item#')
+        qty_col    = col('Qty')
+        amt_col    = col('Extended Amt')
+        date_from  = col('Date From')
+        date_thru  = col('Date Thru')
+
+        if not mcode_col or not qty_col or not amt_col:
+            rows.append({'_error': f'PFS CSV: expected columns Vendor Item#, Qty, Extended Amt — found: {list(df.columns)}'})
+            return rows
+
+        # Dates from first data row
+        start_date = end_date = bill_date = ''
+        if date_from and not df[date_from].dropna().empty:
+            start_date = to_yyyymmdd(df[date_from].dropna().iloc[0].strip())
+        if date_thru and not df[date_thru].dropna().empty:
+            end_date = to_yyyymmdd(df[date_thru].dropna().iloc[0].strip())
+        bill_date = end_date or start_date
+
+        from collections import defaultdict
+        totals_qty = defaultdict(float)
+        totals_amt = defaultdict(float)
+
         for _, r in df.iterrows():
-            row_str = ' '.join(str(v) for v in r.values if v)
-            m = re.search(r'([A-Z]-[A-Z0-9]+)', row_str, re.I)
-            if not m: continue
-            qty_m = re.search(r'\b(\d+)\b', row_str)
-            amt_m = re.search(r'\$?([\d,.]+)\s*$', row_str)
-            rows.append(make_row(source='PFS', program_num=cfg['program_num'],
+            raw_code = str(r.get(mcode_col, '') or '').strip()
+            if not re.match(r'[A-Z]-[A-Z0-9]+', raw_code, re.I): continue
+            item = raw_code.upper()
+            try: qty = float(str(r.get(qty_col, 0) or 0).replace(',', ''))
+            except: qty = 0.0
+            try: amt = float(str(r.get(amt_col, 0) or 0).replace(',', '').strip())
+            except: amt = 0.0
+            totals_qty[item] += qty
+            totals_amt[item] += amt
+
+        for item in sorted(totals_qty):
+            rows.append(make_row(
+                source='PFS', program_num=cfg['program_num'],
                 customer_ref=customer_ref, dist_id=cfg['dist_id'],
-                item=m.group(1).upper(),
-                qty=qty_m.group(1) if qty_m else 0,
-                amount=clean_amount(amt_m.group(1)) if amt_m else 0,
-                trade=cfg['trade']))
+                bill_date=bill_date, start_date=start_date, end_date=end_date,
+                item=item, qty=totals_qty[item], amount=totals_amt[item],
+                trade=cfg['trade']
+            ))
+        if not rows:
+            rows.append({'_error': 'PFS CSV: no M-code rows found in Vendor Item# column'})
     except Exception as e:
-        rows.append({'_error': str(e)})
+        rows.append({'_error': f'PFS CSV: {e}'})
     return rows
 
 def parse_yhata(filepath, cfg, customer_ref):
