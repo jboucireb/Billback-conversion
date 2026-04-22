@@ -1832,6 +1832,7 @@ def detect_supplier(filename):
     if 'KAST' in fn: return 'KAST'
     if 'SOFO' in fn: return 'SOFO'
     if 'PFS' in fn: return 'PFS'
+    if re.search(r'BIDRRPT|BID[_-]?REPT|BIDBILL', fn): return 'PFS'
     if 'BLAIR' in fn: return 'BLAIR_CANDY'
     if 'LABATT' in fn: return 'LABATT'
     if 'SHAMROCK' in fn: return 'SHAMROCK'
@@ -2632,9 +2633,86 @@ def parse_sofo(filepath, cfg, customer_ref):
         rows.append({'_error': str(e)})
     return rows
 
+def parse_pfs_bid_pdf(filepath, cfg, customer_ref):
+    """PFS 'Bid Bill-Back Report' (BIBBRPT10R) PDF format.
+    Each detail line: <6-digit vendor#> <desc> <13/14-digit UPC> <M-code> <ContractId> <Qty> <Each> <Allow> <Extended>
+    Extended (last number) is the billback amount. Aggregates by M-code across all Bids.
+    """
+    rows = []
+    try:
+        all_text = ''
+        with pdfplumber.open(filepath) as pdf:
+            for page in pdf.pages:
+                all_text += (page.extract_text() or '') + '\n'
+
+        # Date range: "From: M/D/YY" and "Thru: M/D/YY" on the header line
+        dr = re.search(r'From:\s+(\d{1,2}/\d{1,2}/\d{2,4}).*?Thru:\s+(\d{1,2}/\d{1,2}/\d{2,4})', all_text, re.I | re.S)
+        start_date = to_yyyymmdd(dr.group(1)) if dr else ''
+        end_date   = to_yyyymmdd(dr.group(2)) if dr else ''
+        bill_date  = end_date or start_date
+
+        # Customer ref from filename: Inv_0123003_... → 0123003
+        inv_m = re.search(r'Inv[_-](\d+)', os.path.basename(filepath), re.I)
+        cust_ref = inv_m.group(1) if inv_m else (customer_ref or '')
+
+        mcode_pat = re.compile(r'\b([A-Z]-?[A-Z]{1,2}\d{3,4}[A-Z0-9]*)\b', re.I)
+        skip_pat  = re.compile(r'Totals|Bid\.\.\.|Vendor\s+\d+\s+Totals|END\s+OF\s+REPORT', re.I)
+
+        from collections import defaultdict
+        totals_qty = defaultdict(float)
+        totals_amt = defaultdict(float)
+
+        for line in all_text.splitlines():
+            if skip_pat.search(line): continue
+            # Data lines start with a 6-digit vendor item number
+            if not re.match(r'^\s*\d{6}\s+', line): continue
+            # Must contain a 13-14 digit UPC
+            upc_m = re.search(r'\b\d{13,14}\b', line)
+            if not upc_m: continue
+            # M-code immediately after UPC
+            after_upc = line[upc_m.end():]
+            mc = mcode_pat.search(after_upc)
+            if not mc: continue
+            mcode = mc.group(1).upper()
+            # Normalise: add dash if missing (e.g. MRP036F → M-RP036F)
+            if not re.match(r'^[A-Z]-', mcode):
+                mcode = mcode[0] + '-' + mcode[1:]
+            # Last 4 numbers on the line are: Qty, Each, Allow, Extended
+            after_mcode = after_upc[mc.end():]
+            nums = re.findall(r'[\d,.]+', after_mcode)
+            if len(nums) < 4: continue
+            try:
+                qty      = float(nums[-4].replace(',', ''))
+                extended = float(nums[-1].replace(',', ''))
+            except Exception:
+                continue
+            if extended == 0: continue  # skip $0.00 lines
+            totals_qty[mcode] += qty
+            totals_amt[mcode] += extended
+
+        for mcode in sorted(totals_qty):
+            rows.append(make_row(
+                source='PFS',
+                program_num=cfg['program_num'],
+                customer_ref=cust_ref,
+                dist_id=cfg['dist_id'],
+                bill_date=bill_date, start_date=start_date, end_date=end_date,
+                item=mcode, qty=totals_qty[mcode], amount=totals_amt[mcode],
+                trade=cfg['trade']
+            ))
+        if not rows:
+            rows.append({'_error': 'PFS Bid Bill-Back PDF: no Monin items found'})
+    except Exception as e:
+        rows.append({'_error': f'PFS Bid Bill-Back PDF: {e}\n{traceback.format_exc()}'})
+    return rows
+
 def parse_pfs(filepath, cfg, customer_ref):
     """PFS Roma / PFG — uses Trackmax format (same engine as Driscoll Foods)."""
     if filepath.lower().endswith('.pdf'):
+        # Check for PFS Bid Bill-Back Report (BIBBRPT10R) format first
+        first_page, err = _pdfplumber_extract_first_page(filepath)
+        if err is None and ('Bid Bill-Back Report' in first_page or 'BIBBRPT' in first_page):
+            return parse_pfs_bid_pdf(filepath, cfg, customer_ref)
         # PFS Roma uses Powered-by-Trackmax format; route through the generic Trackmax parser.
         return parse_trackmax(filepath, cfg, customer_ref, source_name='PFS')
     # Non-PDF (CSV/XLSX) — PFS BidRRpt format
@@ -4214,7 +4292,7 @@ function detectSupplier(filename) {
   const fn = filename.toUpperCase();
   if (fn.includes('KAST'))    return 'KAST';
   if (fn.includes('SOFO'))    return 'SOFO';
-  if (fn.includes('PFS'))     return 'PFS';
+  if (fn.includes('PFS') || /BIDRRPT|BIDREPT|BIDBILL/.test(fn)) return 'PFS';
   if (fn.includes('BLAIR'))   return 'BLAIR_CANDY';
   if (fn.includes('LABATT'))  return 'LABATT';
   if (fn.includes('SHAMROCK')) return 'SHAMROCK';
