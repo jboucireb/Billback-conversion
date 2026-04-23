@@ -2748,7 +2748,19 @@ def parse_pfs(filepath, cfg, customer_ref):
     rows = []
     try:
         import pandas as pd
-        df = pd.read_csv(filepath, dtype=str) if filepath.lower().endswith('.csv') else pd.read_excel(filepath, dtype=str)
+        if filepath.lower().endswith('.csv'):
+            df = None
+            for enc in ('utf-8', 'latin-1', 'cp1252'):
+                try:
+                    df = pd.read_csv(filepath, dtype=str, encoding=enc)
+                    break
+                except UnicodeDecodeError:
+                    continue
+            if df is None:
+                rows.append({'_error': 'PFS CSV: could not decode file (tried utf-8, latin-1, cp1252)'})
+                return rows
+        else:
+            df = pd.read_excel(filepath, dtype=str)
         df.columns = [c.strip() for c in df.columns]
 
         # Locate key columns (case-insensitive, strip whitespace)
@@ -2783,8 +2795,11 @@ def parse_pfs(filepath, cfg, customer_ref):
         for _, r in df.iterrows():
             raw_code = str(r.get(mcode_col, '') or '').strip()
             if not raw_code or raw_code.lower() == 'nan': continue
-            # Accept M-codes with or without dash; normalize to M-XXXXX form
-            if not re.match(r'^[A-Z]-?[A-Z]{1,2}\d{3}', raw_code, re.I): continue
+            # Accept M-codes: already-dashed form (M-RPO40F) or no-dash form (MRP036F)
+            # Use a broad check: [A-Z]-[A-Z0-9]{3,} OR [A-Z]{2,3}\d{3}
+            if not (re.match(r'^[A-Z]-[A-Z0-9]{3,}', raw_code, re.I) or
+                    re.match(r'^[A-Z]{2,3}\d{3}', raw_code, re.I)):
+                continue
             item = _pfs_normalize_mcode(raw_code)
             try: qty = float(str(r.get(qty_col, 0) or 0).replace(',', ''))
             except: qty = 0.0
@@ -2794,8 +2809,10 @@ def parse_pfs(filepath, cfg, customer_ref):
 
             operator = ''
             if bid_desc_col:
-                operator = str(r.get(bid_desc_col, '') or '').strip()
-                if operator.lower() == 'nan': operator = ''
+                raw_op = str(r.get(bid_desc_col, '') or '').strip()
+                if raw_op.lower() != 'nan':
+                    # Strip leading !! / ¢¢ / other non-word prefixes (e.g. "!! ZAXBY" → "ZAXBY")
+                    operator = re.sub(r'^[^A-Z0-9\'(]+', '', raw_op, flags=re.I).strip()
 
             if operator not in bid_data:
                 bid_data[operator] = {}
