@@ -2633,10 +2633,21 @@ def parse_sofo(filepath, cfg, customer_ref):
         rows.append({'_error': str(e)})
     return rows
 
+def _pfs_normalize_mcode(raw):
+    """Normalize a PFS M-code: add missing dash (MRP036F → M-RP036F), uppercase."""
+    code = raw.strip().upper()
+    if re.match(r'^[A-Z]-[A-Z]', code):
+        return code  # already has dash
+    # Bare code like MRP036F, KKfr079F etc — insert dash after first letter
+    if re.match(r'^[A-Z]{2,3}\d{3}', code):
+        return code[0] + '-' + code[1:]
+    return code
+
 def parse_pfs_bid_pdf(filepath, cfg, customer_ref):
     """PFS 'Bid Bill-Back Report' (BIBBRPT10R) PDF format.
-    Each detail line: <6-digit vendor#> <desc> <13/14-digit UPC> <M-code> <ContractId> <Qty> <Each> <Allow> <Extended>
-    Extended (last number) is the billback amount. Aggregates by M-code across all Bids.
+    Each Bid section covers one operator. Emits one row per operator × M-code
+    with Trade=O and Operator ID set to the Bid description (e.g. 'ZAXBY POWELL').
+    Detail line format: <6-digit vendor#> <desc> <13/14-digit UPC> <M-code> <ContractId> <Qty> <Each> <Allow> <Extended>
     """
     rows = []
     try:
@@ -2656,13 +2667,22 @@ def parse_pfs_bid_pdf(filepath, cfg, customer_ref):
         cust_ref = inv_m.group(1) if inv_m else (customer_ref or '')
 
         mcode_pat = re.compile(r'\b([A-Z]-?[A-Z]{1,2}\d{3,4}[A-Z0-9]*)\b', re.I)
+        # Bid section header: "Bid...: 3 !! ZAXBY POWELL" or "Bid...: 148 P TERRY'S MAIN BID"
+        bid_hdr   = re.compile(r'Bid\.\.\.\s*:\s*\d+\s+(?:!!\s+)?(.+)', re.I)
         skip_pat  = re.compile(r'Totals|Bid\.\.\.|Vendor\s+\d+\s+Totals|END\s+OF\s+REPORT', re.I)
 
-        from collections import defaultdict
-        totals_qty = defaultdict(float)
-        totals_amt = defaultdict(float)
+        # bid_data: {operator_name: {mcode: [qty, amt]}}
+        from collections import defaultdict, OrderedDict
+        bid_data = OrderedDict()
+        current_op = ''
 
         for line in all_text.splitlines():
+            bm = bid_hdr.match(line.strip())
+            if bm:
+                current_op = bm.group(1).strip()
+                if current_op not in bid_data:
+                    bid_data[current_op] = {}
+                continue
             if skip_pat.search(line): continue
             # Data lines start with a 6-digit vendor item number
             if not re.match(r'^\s*\d{6}\s+', line): continue
@@ -2673,10 +2693,7 @@ def parse_pfs_bid_pdf(filepath, cfg, customer_ref):
             after_upc = line[upc_m.end():]
             mc = mcode_pat.search(after_upc)
             if not mc: continue
-            mcode = mc.group(1).upper()
-            # Normalise: add dash if missing (e.g. MRP036F → M-RP036F)
-            if not re.match(r'^[A-Z]-', mcode):
-                mcode = mcode[0] + '-' + mcode[1:]
+            mcode = _pfs_normalize_mcode(mc.group(1))
             # Last 4 numbers on the line are: Qty, Each, Allow, Extended
             after_mcode = after_upc[mc.end():]
             nums = re.findall(r'[\d,.]+', after_mcode)
@@ -2686,20 +2703,29 @@ def parse_pfs_bid_pdf(filepath, cfg, customer_ref):
                 extended = float(nums[-1].replace(',', ''))
             except Exception:
                 continue
-            if extended == 0: continue  # skip $0.00 lines
-            totals_qty[mcode] += qty
-            totals_amt[mcode] += extended
+            if extended == 0: continue  # skip $0.00 rows
+            if not current_op:
+                current_op = 'Unknown'
+                bid_data[current_op] = {}
+            d = bid_data[current_op]
+            if mcode not in d:
+                d[mcode] = [0.0, 0.0]
+            d[mcode][0] += qty
+            d[mcode][1] += extended
 
-        for mcode in sorted(totals_qty):
-            rows.append(make_row(
-                source='PFS',
-                program_num=cfg['program_num'],
-                customer_ref=cust_ref,
-                dist_id=cfg['dist_id'],
-                bill_date=bill_date, start_date=start_date, end_date=end_date,
-                item=mcode, qty=totals_qty[mcode], amount=totals_amt[mcode],
-                trade=cfg['trade']
-            ))
+        for operator, mcodes in bid_data.items():
+            for mcode in sorted(mcodes):
+                qty, amt = mcodes[mcode]
+                rows.append(make_row(
+                    source='PFS',
+                    program_num=cfg['program_num'],
+                    customer_ref=cust_ref,
+                    dist_id=cfg['dist_id'],
+                    bill_date=bill_date, start_date=start_date, end_date=end_date,
+                    item=mcode, qty=qty, amount=amt,
+                    trade='O',
+                    operator_id=operator
+                ))
         if not rows:
             rows.append({'_error': 'PFS Bid Bill-Back PDF: no Monin items found'})
     except Exception as e:
@@ -2729,11 +2755,13 @@ def parse_pfs(filepath, cfg, customer_ref):
         col_map = {c.strip().lower(): c for c in df.columns}
         def col(name): return col_map.get(name.lower())
 
-        mcode_col  = col('Vendor Item#')
-        qty_col    = col('Qty')
-        amt_col    = col('Extended Amt')
-        date_from  = col('Date From')
-        date_thru  = col('Date Thru')
+        mcode_col  = col('vendor item#') or col('item no') or col('item number')
+        qty_col    = col('qty') or col('quantity')
+        amt_col    = col('extended amt') or col('extended amount') or col('extended')
+        date_from  = col('date from') or col('from')
+        date_thru  = col('date thru') or col('thru') or col('date through')
+        # Bid Description column holds the operator/chain name per row
+        bid_desc_col = col('bid description') or col('operator') or col('bid desc') or col('chain')
 
         if not mcode_col or not qty_col or not amt_col:
             rows.append({'_error': f'PFS CSV: expected columns Vendor Item#, Qty, Extended Amt — found: {list(df.columns)}'})
@@ -2747,29 +2775,48 @@ def parse_pfs(filepath, cfg, customer_ref):
             end_date = to_yyyymmdd(df[date_thru].dropna().iloc[0].strip())
         bill_date = end_date or start_date
 
-        from collections import defaultdict
-        totals_qty = defaultdict(float)
-        totals_amt = defaultdict(float)
+        # bid_data: {operator_name: {mcode: [qty, amt]}}
+        # If no Bid Description column, use a single key '' (aggregate all)
+        from collections import OrderedDict
+        bid_data = OrderedDict()
 
         for _, r in df.iterrows():
             raw_code = str(r.get(mcode_col, '') or '').strip()
-            if not re.match(r'[A-Z]-[A-Z0-9]+', raw_code, re.I): continue
-            item = raw_code.upper()
+            if not raw_code or raw_code.lower() == 'nan': continue
+            # Accept M-codes with or without dash; normalize to M-XXXXX form
+            if not re.match(r'^[A-Z]-?[A-Z]{1,2}\d{3}', raw_code, re.I): continue
+            item = _pfs_normalize_mcode(raw_code)
             try: qty = float(str(r.get(qty_col, 0) or 0).replace(',', ''))
             except: qty = 0.0
             try: amt = float(str(r.get(amt_col, 0) or 0).replace(',', '').strip())
             except: amt = 0.0
-            totals_qty[item] += qty
-            totals_amt[item] += amt
+            if amt == 0: continue
 
-        for item in sorted(totals_qty):
-            rows.append(make_row(
-                source='PFS', program_num=cfg['program_num'],
-                customer_ref=customer_ref, dist_id=cfg['dist_id'],
-                bill_date=bill_date, start_date=start_date, end_date=end_date,
-                item=item, qty=totals_qty[item], amount=totals_amt[item],
-                trade=cfg['trade']
-            ))
+            operator = ''
+            if bid_desc_col:
+                operator = str(r.get(bid_desc_col, '') or '').strip()
+                if operator.lower() == 'nan': operator = ''
+
+            if operator not in bid_data:
+                bid_data[operator] = {}
+            d = bid_data[operator]
+            if item not in d:
+                d[item] = [0.0, 0.0]
+            d[item][0] += qty
+            d[item][1] += amt
+
+        has_operators = bid_desc_col and any(k for k in bid_data)
+        for operator, mcodes in bid_data.items():
+            for item in sorted(mcodes):
+                qty, amt = mcodes[item]
+                rows.append(make_row(
+                    source='PFS', program_num=cfg['program_num'],
+                    customer_ref=customer_ref, dist_id=cfg['dist_id'],
+                    bill_date=bill_date, start_date=start_date, end_date=end_date,
+                    item=item, qty=qty, amount=amt,
+                    trade='O' if has_operators else cfg['trade'],
+                    operator_id=operator if has_operators else ''
+                ))
         if not rows:
             rows.append({'_error': 'PFS CSV: no M-code rows found in Vendor Item# column'})
     except Exception as e:
