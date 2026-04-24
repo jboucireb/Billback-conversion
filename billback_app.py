@@ -1734,6 +1734,22 @@ DEFAULT_SUPPLIER_CONFIG = {
     'DELCO_FOODS':  {'program_num': '',        'dist_id': '',           'trade': 'D'},
     'CHEFS_WH':     {'program_num': '',        'dist_id': '',           'trade': 'D'},
     'ATLAS':        {'program_num': '',        'dist_id': '',           'trade': 'D'},
+    'KOHL_WH':      {'program_num': '',        'dist_id': '',           'trade': 'D',
+        'product_map': {
+            '399093': 'M-FR049F',
+            '399159': 'M-AT080A',
+            '464377': 'M-FR114F',
+            '501756': 'M-FR145F',
+            '522704': 'M-FR092F',
+            '538963': 'M-FR195F',
+            '601578': 'M-FR197F',
+            '641090': 'M-FR061F',
+            '656163': 'M-FR252F',
+            '63511':  'P240',
+            '65228':  'P245',
+            '67896':  'P230',
+        }
+    },
     'UNKNOWN':      {'program_num': '',        'dist_id': '',           'trade': 'D'},
 }
 
@@ -1848,6 +1864,7 @@ def detect_supplier(filename):
     if re.search(r'ATLAS[\s_]?WHOLESALE|ATLAS[\s_]?FOOD', fn): return 'ATLAS'
     if re.search(r'Y[\s.]?HATA|Y_HATA|TM\s+\d{6}', fn): return 'Y_HATA'
     if 'DRISCOLL' in fn: return 'DRISCOLL'
+    if 'KOHL' in fn: return 'KOHL_WH'
     if 'HARBOR' in fn: return 'HARBOR'
     if 'SUPPLIER BILLBACK' in fn or 'SUPPLIER_BILLBACK' in fn: return 'HARBOR'
     m = re.search(r'CUST\s+(\d+)', fn.replace('  ',' '))
@@ -2064,6 +2081,10 @@ def parse_sw_pdf(filepath, cfg, customer_ref, source_override=''):
         # No full-text dedup here — short lines like "STRAWBERRY Cost" repeat legitimately.
         # Instead we deduplicate at the match level using a seen_matches set below.
 
+        # Normalize M-codes where PDF extraction emits a space instead of a dash
+        # e.g. "M FR210F" → "M-FR210F"
+        all_text = re.sub(r'\bM\s+([A-Z]{2}\d{3,4}[A-Z0-9]*)\b', r'M-\1', all_text)
+
         # Dates
         bill_date = start_date = end_date = ''
         m = re.search(r'(?:generated|posted)\s+on\s+(\d{1,2}/\d{1,2}/\d{4})', all_text, re.I)
@@ -2088,11 +2109,11 @@ def parse_sw_pdf(filepath, cfg, customer_ref, source_override=''):
         # Line pattern: positive invoice lines
         # Format: ... MONIN <PackSize> <Description> <ProductID> <DID>CS <UPC> <Qty> <Wt> BB To .../unit $<Amt>
         line_pat = re.compile(
-            r'MONIN\s+([\d/.]+(?:\s+\d+)?(?:\s*(?:LITER|LITERS|LTR|LT|ML|L|OZ|EA))?)\s+'  # PackSize
+            r'MONIN\s+([\d/.]+(?:\s+\d+)?(?:\s*(?:LITER|LITERS|LTR|LT|ML|L|OZ|EA|Z))?)\s+'  # PackSize (Z = oz abbrev)
             r'(?:\S+\s+)*?'                            # Description words (non-greedy)
             r'([A-Z]-[A-Z0-9]+|[A-Z]\d{3,5}|\d{5,6})\s+'  # Product ID
-            r'\w{3,8}\s+'                              # DID
-            r'(?:(?:\d{10,16}|[A-Z]-[A-Z0-9]+)\s+)?'   # UPC (numeric barcode OR M-code repeated as UPC)
+            r'(?:\*N\*|\w{3,8})\s+'                   # DID (*N* = no distributor ID, or alphanumeric)
+            r'(?:(?:\d{6,16}|[A-Z]-[A-Z0-9]+)\s+){0,2}'  # UPC: 0-2 elements (barcode OR M-code in UPC slot)
             r'(\d[\d,]*\.?\d*)\s+'                     # Quantity (must start with digit — rejects credit lines)
             r'[\d,.]+\s+'                              # Total Weight
             r'(?:\$[\d,.]+\s+){0,2}'                   # 0-2 pre-amounts
@@ -2103,11 +2124,11 @@ def parse_sw_pdf(filepath, cfg, customer_ref, source_override=''):
 
         # Credit/return line pattern — qty and amount are in parentheses: (1.00) (weight) ($7.98)
         credit_pat = re.compile(
-            r'MONIN\s+([\d/.]+(?:\s+\d+)?(?:\s*(?:LITER|LITERS|LTR|LT|ML|L|OZ|EA))?)\s+'
+            r'MONIN\s+([\d/.]+(?:\s+\d+)?(?:\s*(?:LITER|LITERS|LTR|LT|ML|L|OZ|EA|Z))?)\s+'
             r'(?:\S+\s+)*?'
             r'([A-Z]-[A-Z0-9]+|[A-Z]\d{3,5}|\d{5,6})\s+'
-            r'\w{3,8}\s+'
-            r'(?:(?:\d{10,16}|[A-Z]-[A-Z0-9]+)\s+)?'  # UPC (numeric barcode OR M-code repeated as UPC)
+            r'(?:\*N\*|\w{3,8})\s+'
+            r'(?:(?:\d{6,16}|[A-Z]-[A-Z0-9]+)\s+){0,2}'  # UPC: 0-2 elements (barcode OR M-code in UPC slot)
             r'\((\d[\d,]*\.?\d*)\)\s+'   # qty in parens
             r'\([\d,.]+\)\s+'            # weight in parens
             r'(?:(?:\$[\d,.]+|\(\$[\d,.]+\))\s+){0,2}'  # 0-2 amounts: plain $X.XX or ($X.XX) for credit lines
@@ -2143,6 +2164,22 @@ def parse_sw_pdf(filepath, cfg, customer_ref, source_override=''):
             seen_matches.add(match_key)
             pack_size = m.group(1).strip()
             prod_id   = m.group(2).upper()
+            # If ProductID is numeric, check product_map first, then try UPC-slot M-code extraction
+            # (Kohl Wholesale: 6-digit ProductID, M-code lives in UPC column)
+            if re.match(r'^\d+$', prod_id):
+                product_map = cfg.get('product_map', {})
+                # Strip leading zeros for product_map lookup (PDF may pad to 6 digits)
+                prod_id_stripped = prod_id.lstrip('0') or prod_id
+                if prod_id_stripped in product_map:
+                    prod_id = product_map[prod_id_stripped]
+                elif prod_id in product_map:
+                    prod_id = product_map[prod_id]
+                else:
+                    upc_m = re.search(
+                        rf'{re.escape(prod_id)}\s+(?:\*N\*|\w{{3,8}})\s+(?:\d+\s+)?([A-Z]-[A-Z0-9]+|[A-Z]\d{{3,5}})',
+                        m.group(0), re.I)
+                    if upc_m:
+                        prod_id = upc_m.group(1).upper()
             qty       = float(m.group(3))
             amt       = float(m.group(4).replace(',', ''))
             totals_qty[prod_id] += qty
@@ -2199,6 +2236,17 @@ def parse_sw_pdf(filepath, cfg, customer_ref, source_override=''):
         for prod_id in totals_qty:
             item_code = prod_id
             if re.match(r'^\d+$', prod_id):
+                # 0. product_map (ProductID → M-code, e.g. Kohl Wholesale)
+                product_map = cfg.get('product_map', {})
+                prod_id_stripped = prod_id.lstrip('0') or prod_id
+                pm_key = prod_id_stripped if prod_id_stripped in product_map else prod_id
+                if pm_key in product_map:
+                    item_code = product_map[pm_key]
+                    resolved_qty[item_code] += totals_qty[prod_id]
+                    resolved_amt[item_code] += totals_amt[prod_id]
+                    if item_code not in resolved_pack:
+                        resolved_pack[item_code] = prod_pack.get(prod_id, '')
+                    continue
                 # 1. DID map (explicit, most accurate — used for Christ Panos etc.)
                 did_val = prod_did.get(prod_id, '')
                 if did_val and did_val in did_map:
@@ -3562,6 +3610,9 @@ def parse_supplier_billback_pdf(filepath, cfg, customer_ref):
         return parse_chefs_warehouse(filepath, cfg, customer_ref)
     if re.search(r'REVENUE\s+TRACKING\s+REPORT', first_page, re.I) and 'MFG#' in first_page:
         return parse_atlas(filepath, cfg, customer_ref)
+    # Kohl Wholesale — Trackmax PDF with numeric ProductIDs and M-codes in UPC slot
+    if 'Kohl Wholesale' in first_page:
+        return parse_sw_pdf(filepath, cfg, customer_ref, source_override='Kohl Wholesale')
     # S&W Trackmax PDF — uses numeric product IDs instead of M-codes
     if 'S&W Wholesale' in first_page or 's-wfoods' in first_page.lower():
         return parse_sw_pdf(filepath, cfg, customer_ref)
@@ -4009,6 +4060,8 @@ def detect_and_parse(filepath, user_config=None, customer_ref='', file_override=
         return _ret(supplier, parse_chefs_warehouse(filepath, cfg, customer_ref))
     elif supplier == 'ATLAS':
         return _ret(supplier, parse_atlas(filepath, cfg, customer_ref))
+    elif supplier == 'KOHL_WH':
+        return _ret(supplier, parse_sw_pdf(filepath, cfg, customer_ref, source_override='Kohl Wholesale'))
     elif supplier == 'LABATT':
         return _ret(supplier, parse_labatt(filepath, cfg, customer_ref))
     elif supplier == 'HARBOR':
@@ -4026,6 +4079,8 @@ def detect_and_parse(filepath, user_config=None, customer_ref='', file_override=
                 return _ret('CHEFS_WH', result)
             if src == 'Atlas Wholesale Food':
                 return _ret('ATLAS', result)
+            if src == 'Kohl Wholesale':
+                return _ret('KOHL_WH', result)
         return _ret(supplier, result)
     elif supplier == 'MARTIN_BROS':
         return _ret(supplier, parse_martin_bros(filepath, cfg, customer_ref))
@@ -4372,6 +4427,7 @@ function detectSupplier(filename) {
   if (/ATLAS[\s_]?WHOLESALE|ATLAS[\s_]?FOOD/.test(fn)) return 'ATLAS';
   if (/Y[\s.]?HATA|Y_HATA/.test(fn)) return 'Y_HATA';
   if (fn.includes('DRISCOLL')) return 'DRISCOLL';
+  if (fn.includes('KOHL')) return 'KOHL_WH';
   if (fn.includes('DELCO')) return 'DELCO_FOODS';
   if (/CHEFS.{0,6}WH|CHEFSWAREHOUSE|DAIRYLAND/.test(fn)) return 'CHEFS_WH';
   if (fn.includes('HARBOR') || fn.includes('SUPPLIER BILLBACK') || fn.includes('SUPPLIER_BILLBACK')) return 'HARBOR';
@@ -4404,6 +4460,7 @@ function distNameToKey(name) {
   if (u.includes('DELCO')) return 'DELCO_FOODS';
   if (u.includes('CHEFSWAREHOUSE') || u.includes('CHEFSWHSE') || u.includes('DAIRYLAND') || u.includes('CHEFSW')) return 'CHEFS_WH';
   if (u.includes('ATLAS')) return 'ATLAS';
+  if (u.includes('KOHL')) return 'KOHL_WH';
   // Everything else: route through content-based PDF dispatcher (don't force Harbor)
   return 'UNKNOWN';
 }
@@ -4419,6 +4476,7 @@ const KEY_TO_DISPLAY = {
   DELCO_FOODS:'Delco Foods',
   CHEFS_WH:'The Chefs Warehouse',
   ATLAS:'Atlas Wholesale Food',
+  KOHL_WH:'Kohl Wholesale',
   BLAIR_CANDY:'Blair Candy', UNKNOWN:''
 };
 
