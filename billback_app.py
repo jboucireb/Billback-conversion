@@ -1910,54 +1910,130 @@ def parse_bek_or_nich(filepath, source_name, cfg, customer_ref):
     return rows
 
 def parse_shamrock(filepath, cfg, customer_ref):
+    """Shamrock Foods XLSX billback parser.
+
+    Supports two formats:
+      A) Old format — header row contains 'MFG PROD #'; simple per-row M-code + amount.
+      B) New format — header row 1 contains 'MFG ID' (col AA), 'PA NAME' (col H),
+         'BRANCH' (col D). Each row is one invoice line; aggregates per operator × M-code.
+         Emits Trade=O with Operator ID = PA Name.
+    """
     rows = []
     try:
         wb = __import__('openpyxl').load_workbook(filepath, data_only=True)
         ws = wb.active
         header_row = None
         col_map = {}
+
         for i, row in enumerate(ws.iter_rows(values_only=True), 1):
-            row_vals = [str(v).strip() if v else '' for v in row]
-            if 'MFG PROD #' in row_vals or 'MFG PROD#' in row_vals or any('MFG' in c and 'PROD' in c for c in row_vals):
+            row_vals = [str(v).strip() if v is not None else '' for v in row]
+            row_upper = [v.upper() for v in row_vals]
+            # Old format: "MFG PROD #" / "MFG PROD#"
+            if any('MFG' in c and 'PROD' in c for c in row_upper):
                 header_row = i
                 col_map = {v.upper(): j for j, v in enumerate(row_vals)}
                 break
+            # New format: "MFG ID" column present alongside "PA NAME" / "BRANCH"
+            if 'MFG ID' in row_upper and ('PA NAME' in row_upper or 'PA NUMBER' in row_upper):
+                header_row = i
+                col_map = {v.upper(): j for j, v in enumerate(row_vals)}
+                break
+
         if header_row is None:
             return [{'_error': 'SHAMROCK: header not found'}]
+
         def gc(key_options):
             for k in key_options:
                 for ck, ci in col_map.items():
                     if k in ck: return ci
             return None
-        ci_item   = gc(['MFG PROD'])
-        ci_qty    = gc(['QUANTITY','QTY'])
-        ci_amt    = gc(['NET ALLOW','ALLOW','AMOUNT'])
-        ci_bill   = gc(['INVOICE DATE','BILL DATE'])
-        ci_start  = gc(['START','FROM'])
-        ci_end    = gc(['END','TO','THRU'])
-        for row in ws.iter_rows(min_row=header_row+1, values_only=True):
-            row_vals = [str(v).strip() if v is not None else '' for v in row]
-            if not any(row_vals): continue
-            item = row_vals[ci_item] if ci_item is not None else ''
-            if not item or not item.upper().startswith('M-'): continue
-            qty  = row_vals[ci_qty]  if ci_qty  is not None else 0
-            amt  = clean_amount(row_vals[ci_amt]  if ci_amt  is not None else 0)
-            bill = to_yyyymmdd(row_vals[ci_bill]  if ci_bill is not None else '')
-            start= to_yyyymmdd(row_vals[ci_start] if ci_start is not None else '')
-            end  = to_yyyymmdd(row_vals[ci_end]   if ci_end  is not None else '')
-            rows.append(make_row(
-                source='Shamrock',
-                program_num=cfg['program_num'],
-                customer_ref=customer_ref,
-                dist_id=cfg['dist_id'],
-                bill_date=bill,
-                start_date=start,
-                end_date=end,
-                item=item,
-                qty=qty,
-                amount=amt,
-                trade=cfg['trade']
-            ))
+
+        # ── New format (MFG ID / PA NAME / BRANCH) ───────────────────────────
+        if 'MFG ID' in col_map:
+            ci_item     = col_map.get('MFG ID')
+            ci_qty      = gc(['QUANTITY', 'QTY'])
+            ci_amt      = gc(['TOTAL ALLOWANCE', 'ALLOWANCE/CASE', 'ALLOW'])
+            ci_bill     = gc(['PAYMENT DATE', 'INVOICE DATE', 'BILL DATE'])
+            ci_operator = gc(['PA NAME', 'PA NUMBER'])
+            ci_branch   = gc(['BRANCH'])
+            ci_ref      = gc(['MEMO NUMBER', 'MEMO NUM'])
+
+            from collections import defaultdict
+            # Key: (operator, item_code) → {qty, amt, bill_date, source, cref}
+            agg_qty = defaultdict(float)
+            agg_amt = defaultdict(float)
+            agg_meta = {}  # first-seen bill_date + source per key
+
+            for row in ws.iter_rows(min_row=header_row + 1, values_only=True):
+                rv = [str(v).strip() if v is not None else '' for v in row]
+                if not any(rv): continue
+                item = rv[ci_item].strip().upper() if ci_item is not None else ''
+                if not item or not item.startswith('M-'): continue
+
+                operator = rv[ci_operator].strip() if ci_operator is not None else ''
+                qty_raw  = rv[ci_qty] if ci_qty is not None else 0
+                amt_raw  = rv[ci_amt] if ci_amt is not None else 0
+                bill     = to_yyyymmdd(rv[ci_bill] if ci_bill is not None else '')
+                branch   = rv[ci_branch].strip() if ci_branch is not None else 'Shamrock'
+                cref     = rv[ci_ref].strip() if ci_ref is not None else (customer_ref or '')
+
+                # Use customer_ref override if provided, else from Memo Number column
+                if customer_ref:
+                    cref = customer_ref
+
+                key = (operator, item)
+                agg_qty[key] += float(qty_raw or 0)
+                agg_amt[key] += clean_amount(amt_raw)
+                if key not in agg_meta:
+                    agg_meta[key] = {'bill': bill, 'source': branch, 'cref': cref}
+
+            for (operator, item), meta in agg_meta.items():
+                rows.append(make_row(
+                    source=meta['source'],
+                    program_num=cfg['program_num'],
+                    customer_ref=meta['cref'],
+                    dist_id=cfg['dist_id'],
+                    bill_date=meta['bill'],
+                    start_date='',
+                    end_date='',
+                    item=item,
+                    qty=round(agg_qty[(operator, item)], 4),
+                    amount=round(agg_amt[(operator, item)], 2),
+                    trade='O',
+                    operator_id=operator
+                ))
+
+        # ── Old format (MFG PROD #) ───────────────────────────────────────────
+        else:
+            ci_item   = gc(['MFG PROD'])
+            ci_qty    = gc(['QUANTITY', 'QTY'])
+            ci_amt    = gc(['NET ALLOW', 'ALLOW', 'AMOUNT'])
+            ci_bill   = gc(['INVOICE DATE', 'BILL DATE'])
+            ci_start  = gc(['START', 'FROM'])
+            ci_end    = gc(['END', 'TO', 'THRU'])
+            for row in ws.iter_rows(min_row=header_row + 1, values_only=True):
+                rv = [str(v).strip() if v is not None else '' for v in row]
+                if not any(rv): continue
+                item = rv[ci_item] if ci_item is not None else ''
+                if not item or not item.upper().startswith('M-'): continue
+                qty  = rv[ci_qty]  if ci_qty  is not None else 0
+                amt  = clean_amount(rv[ci_amt] if ci_amt is not None else 0)
+                bill = to_yyyymmdd(rv[ci_bill]  if ci_bill  is not None else '')
+                start= to_yyyymmdd(rv[ci_start] if ci_start is not None else '')
+                end  = to_yyyymmdd(rv[ci_end]   if ci_end   is not None else '')
+                rows.append(make_row(
+                    source='Shamrock',
+                    program_num=cfg['program_num'],
+                    customer_ref=customer_ref,
+                    dist_id=cfg['dist_id'],
+                    bill_date=bill,
+                    start_date=start,
+                    end_date=end,
+                    item=item,
+                    qty=qty,
+                    amount=amt,
+                    trade=cfg['trade']
+                ))
     except Exception as e:
         rows.append({'_error': str(e)})
     return rows
