@@ -1797,7 +1797,13 @@ def month_name_to_range(period_str):
 
 def clean_amount(val):
     if val is None: return 0.0
+    # Guard against pandas NaT / NaN objects before str() conversion
+    try:
+        if pd.isna(val): return 0.0
+    except (TypeError, ValueError):
+        pass
     s = str(val).replace('$','').replace(',','').strip()
+    if s.lower() in ('nan', 'nat', 'none', ''): return 0.0
     neg = s.startswith('(') and s.endswith(')')
     s = s.strip('()')
     try:
@@ -3918,11 +3924,15 @@ def parse_cheney(filepath, cfg, customer_ref):
         totals_amt = defaultdict(float)
         for _, row in df.iterrows():
             raw = str(row.get('Manufacture Part Number', '') or '').strip()
-            if not raw or raw.lower() == 'nan':
+            if not raw or raw.lower() in ('nan', 'nat'):
                 continue
             code = raw.upper()
-            totals_qty[code] += float(row.get('Quantity', 0) or 0)
-            totals_amt[code] += float(row.get('Net Value',  0) or 0)
+            # Skip annotation rows (row 8: 'ITEM NUMBER') — only process M- or P- codes
+            if not re.match(r'^[MP]-[A-Z0-9]', code):
+                continue
+            # Use clean_amount to safely handle NaT/NaN/text in numeric cells
+            totals_qty[code] += clean_amount(row.get('Quantity', 0))
+            totals_amt[code] += clean_amount(row.get('Net Value',  0))
         if not totals_amt:
             return [{'_error': 'Cheney: no product rows found (missing Manufacture Part Number or Net Value)'}]
         for code, amt in totals_amt.items():
