@@ -3890,15 +3890,23 @@ def parse_atlas(filepath, cfg, customer_ref):
 
 def parse_cheney(filepath, cfg, customer_ref):
     """Cheney Brothers XLSX billback.
-    Columns: Manufacture Part Number (M-code), Quantity, Net Value, Document Date, CLAIM NO"""
+    Columns (per row-8 annotations):
+      W = Manufacture Part Number (M-code)   → Item Number
+      Y = Quantity                            → Item Volume Qty
+      AG = Net Value                          → Item Dollar Amount
+      H = Document Date                       → Billback Date
+      E = PO Invoice Date                     → BB Start Date AND BB End Date
+      AI = CLAIM NO                           → Customer Ref
+    """
     rows = []
     try:
         df = pd.read_excel(filepath, header=0)
-        # Dates
-        bill_dates = [to_yyyymmdd(v) for v in df.get('Document Date', []) if to_yyyymmdd(v)]
+        # Billback date from Document Date (col H); start/end from PO Invoice Date (col E)
+        bill_dates = [to_yyyymmdd(v) for v in df.get('Document Date',   []) if to_yyyymmdd(v)]
+        po_dates   = [to_yyyymmdd(v) for v in df.get('PO Invoice Date', []) if to_yyyymmdd(v)]
         bill_date  = bill_dates[0]  if bill_dates else ''
-        start_date = min(bill_dates) if bill_dates else ''
-        end_date   = max(bill_dates) if bill_dates else ''
+        start_date = po_dates[0]    if po_dates   else bill_date
+        end_date   = po_dates[0]    if po_dates   else bill_date
         # Customer ref from CLAIM NO
         if not customer_ref and 'CLAIM NO' in df.columns:
             cr = df['CLAIM NO'].iloc[0]
