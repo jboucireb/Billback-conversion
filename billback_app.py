@@ -3987,6 +3987,9 @@ def _match_houstons_desc(description, pack=''):
     is_750  = '750' in desc
     is_64   = '64' in desc and not is_750                          # explicitly 64oz
     is_12oz = bool(re.search(r'\b12\s*oz\b', desc)) and not is_750 and not is_64  # 12oz sauce
+    # 4pk without explicit size → infer 64oz (only 64oz sauces come in 4-packs)
+    if is_4pk and not is_64 and not is_750 and not is_12oz:
+        is_64 = True
 
     # Clean description for flavor extraction
     clean = re.sub(r'\([^)]*\)', ' ', desc)          # remove parentheticals
@@ -4213,6 +4216,97 @@ def _extract_claim_period(page1_text):
         end   = f'{year}{month_num:02d}{last_day:02d}'
         return start, end
     return None, None
+
+
+def _parse_houstons_ellianos(pdf, cfg, customer_ref, ref_num, inv_date, start_date, end_date):
+    """Parse Two Valleys Dist. / Ellianos billback report (page 2).
+
+    Format:
+      Monin <Description> [PET]  QTY  Paid  BillbackPrice  PerUnitBillback  Claimed
+    QTY is in bottles; convert to cases (÷12 for syrups, ÷4 for 64oz sauces).
+    Claimed = per-line dollar amount to claim.
+    """
+    from collections import defaultdict
+    program_num = cfg.get('program_num', '')
+    dist_id     = cfg.get('dist_id',     '')
+    trade       = cfg.get('trade',       'D')
+
+    totals_qty = defaultdict(float)
+    totals_amt = defaultdict(float)
+
+    # Line pattern: Description  QTY  Paid  BillbackPrice  PerUnit  Claimed
+    line_pat = re.compile(
+        r'^(Monin\b.+?)\s+(\d+)\s+[\d.]+\s+[\d.]+\s+[\d.]+\s+([\d.]+)\s*$',
+        re.I
+    )
+
+    for pg in pdf.pages[1:]:
+        text  = pg.extract_text() or ''
+        lines = text.split('\n')
+
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+
+            m = line_pat.match(line)
+            if not m:
+                continue
+
+            description  = m.group(1).strip()
+            qty_bottles  = int(m.group(2))
+            claimed      = float(m.group(3))
+
+            if qty_bottles == 0 or claimed == 0:
+                continue
+
+            # Determine pack and case size from description
+            desc_l = description.lower()
+            if 'sauce' in desc_l:
+                pack     = '4pk'
+                cs_size  = 4   # 64oz sauces: 4 per case
+            else:
+                pack     = '12pk'
+                cs_size  = 12  # 750ml syrups: 12 per case
+
+            # Clean description for matching: remove "Monin", "PET", "Syrup", "Sauce"
+            clean_desc = re.sub(r'\bmonin\b', '', desc_l, flags=re.I)
+            clean_desc = re.sub(r'\b(pet|syrup|sauce)\b', '', clean_desc, flags=re.I)
+            clean_desc = re.sub(r'\s+', ' ', clean_desc).strip()
+
+            mcode = _match_houstons_desc(clean_desc, pack)
+            key   = mcode if mcode else f'UNMATCHED:{description}'
+
+            totals_qty[key] += qty_bottles / cs_size
+            totals_amt[key] += claimed
+
+    rows = []
+    for key, amt in sorted(totals_amt.items()):
+        if key.startswith('UNMATCHED:'):
+            desc = key.split(':', 1)[1]
+            rows.append({'_warning': (
+                f"Ellianos '{desc}' — no M-code match. "
+                f"Amount: ${amt:.2f}. Please enter manually."
+            )})
+        else:
+            qty_val = totals_qty[key]
+            rows.append(make_row(
+                source="Houston's Inc.",
+                program_num=program_num,
+                customer_ref=customer_ref or ref_num,
+                dist_id=dist_id,
+                bill_date=inv_date,
+                start_date=start_date or inv_date,
+                end_date=end_date or inv_date,
+                item=key,
+                qty=round(qty_val, 3),
+                amount=round(amt, 2),
+                trade=trade,
+            ))
+
+    if not rows:
+        rows = [{'_error': f"Houston's Ellianos: no product rows found. Ref: {ref_num}"}]
+    return rows
 
 
 def _parse_houstons_toppot(pdf, cfg, customer_ref, ref_num, inv_date, start_date, end_date):
@@ -4586,6 +4680,10 @@ def parse_houstons(filepath, cfg, customer_ref):
                 )
             elif 'MEDOSWEET' in p1_upper:
                 rows = _parse_houstons_medosweet(
+                    pdf, cfg, customer_ref, ref_num, inv_date, start_date, end_date
+                )
+            elif 'ELLIANOS' in p1_upper:
+                rows = _parse_houstons_ellianos(
                     pdf, cfg, customer_ref, ref_num, inv_date, start_date, end_date
                 )
             elif 'TWO VALLEYS' in p1_upper:
