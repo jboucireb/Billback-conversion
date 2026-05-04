@@ -4284,10 +4284,7 @@ def _parse_houstons_ellianos(pdf, cfg, customer_ref, ref_num, inv_date, start_da
     for key, amt in sorted(totals_amt.items()):
         if key.startswith('UNMATCHED:'):
             desc = key.split(':', 1)[1]
-            rows.append({'_warning': (
-                f"Ellianos '{desc}' — no M-code match. "
-                f"Amount: ${amt:.2f}. Please enter manually."
-            )})
+            rows.append({'_warning': True, 'code': desc, 'desc': 'No M-code match — enter manually', 'amount': round(amt, 2)})
         else:
             qty_val = totals_qty[key]
             rows.append(make_row(
@@ -4377,10 +4374,7 @@ def _parse_houstons_toppot(pdf, cfg, customer_ref, ref_num, inv_date, start_date
 
             # "750ml (Reg & SF)" bundles two products — can't auto-match
             if re.search(r'reg\s*&\s*sf', desc_l):
-                rows.append({'_warning': (
-                    f"Top Pot '750ml (Reg & SF)': {qty} cases, ${total:.2f} — "
-                    f"bundles regular + sugar free 750ml. Please split and enter manually."
-                )})
+                rows.append({'_warning': True, 'code': description, 'desc': 'Bundles Reg+SF — split and enter manually', 'amount': round(total, 2)})
                 continue
 
             mcode = _match_houstons_desc(description, pack)
@@ -4399,10 +4393,7 @@ def _parse_houstons_toppot(pdf, cfg, customer_ref, ref_num, inv_date, start_date
                     trade=trade,
                 ))
             else:
-                rows.append({'_warning': (
-                    f"Top Pot '{description}': {qty} cases, ${total:.2f} — "
-                    f"no M-code match. Please enter manually."
-                )})
+                rows.append({'_warning': True, 'code': description, 'desc': 'No M-code match — enter manually', 'amount': round(total, 2)})
 
     if not rows:
         rows = [{'_error': f"Houston's Top Pot: no product rows found. Ref: {ref_num}"}]
@@ -4582,10 +4573,7 @@ def _parse_houstons_medosweet(pdf, cfg, customer_ref, ref_num, inv_date,
     for key, amt in sorted(totals_amt.items()):
         if key.startswith('UNMATCHED:'):
             _, code, desc = key.split(':', 2)
-            rows.append({'_warning': (
-                f"Medosweet item {code} ('{desc}') — no M-code match found. "
-                f"Amount: ${amt:.2f}. Please enter manually."
-            )})
+            rows.append({'_warning': True, 'code': code, 'desc': f"{desc} — no M-code match, enter manually", 'amount': round(amt, 2)})
         else:
             rows.append(make_row(
                 source="Houston's Inc.",
