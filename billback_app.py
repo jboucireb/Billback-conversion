@@ -1750,6 +1750,7 @@ DEFAULT_SUPPLIER_CONFIG = {
             '67896':  'P230',
         }
     },
+    'HOUSTONS':     {'program_num': '',        'dist_id': '',           'trade': 'D'},
     'UNKNOWN':      {'program_num': '',        'dist_id': '',           'trade': 'D'},
 }
 
@@ -1871,6 +1872,7 @@ def detect_supplier(filename):
     if re.search(r'Y[\s.]?HATA|Y_HATA|TM\s+\d{6}', fn): return 'Y_HATA'
     if 'DRISCOLL' in fn: return 'DRISCOLL'
     if 'KOHL' in fn: return 'KOHL_WH'
+    if re.match(r'DM(?:CB|I\d|OR|-|TOPOT|TOPPOT)', fn): return 'HOUSTONS'
     if 'HARBOR' in fn: return 'HARBOR'
     if 'SUPPLIER BILLBACK' in fn or 'SUPPLIER_BILLBACK' in fn: return 'HARBOR'
     m = re.search(r'CUST\s+(\d+)', fn.replace('  ',' '))
@@ -3682,6 +3684,8 @@ def parse_supplier_billback_pdf(filepath, cfg, customer_ref):
     if len(first_page.strip()) < 50:
         return [{'_error': 'This PDF appears to be image-based (scanned). Text extraction is not supported — please enter the data manually or request a text-based PDF from the distributor.'}]
 
+    if "Houston's Inc. Debit Memo" in first_page or "Houston's Inc Debit Memo" in first_page:
+        return parse_houstons(filepath, cfg, customer_ref)
     if 'Martin Bros' in first_page:
         return parse_martin_bros(filepath, cfg, customer_ref)
     if 'Driscoll Foods' in first_page:
@@ -3948,6 +3952,483 @@ def parse_cheney(filepath, cfg, customer_ref):
     return rows
 
 
+# ─── HOUSTON'S INC. DEBIT MEMO ───────────────────────────────────────────────
+
+def _match_houstons_desc(description, pack=''):
+    """Match a Houston's product description to an M-code from ITEM_LOOKUP.
+
+    pack hint: '' = auto-detect from description parentheticals like (12/CS),
+               'U' = single 750 mL unit, '12pk'/'A'/'12' = 12-pack,
+               '6pk'/'B'/'6' = 6-pack.
+    Returns the best M-code string or None.
+    """
+    desc = description.lower().strip()
+
+    # Detect type modifiers
+    is_organic = 'organic' in desc or bool(re.search(r'\borg\b', desc))
+    is_nz      = 'natural zero' in desc
+    is_sf      = 'sugar free' in desc or bool(re.search(r'\bsf\b', desc))
+
+    # Auto-detect pack from "(NN/CS)" pattern in description
+    if not pack:
+        cs_m = re.search(r'\((\d+)/cs\)', desc)
+        if cs_m:
+            n = int(cs_m.group(1))
+            pack = '12pk' if n == 12 else ('6pk' if n == 6 else pack)
+
+    is_12pk = pack in ('12pk', 'A', '12')
+    is_6pk  = pack in ('6pk',  'B', '6')
+    is_unit = not is_12pk and not is_6pk  # single unit (750 mL or 64 oz)
+
+    # Detect size from description
+    is_750 = '750' in desc
+    is_64  = ('64' in desc or 'oz' in desc) and not is_750
+
+    # Clean description for flavor extraction
+    clean = re.sub(r'\([^)]*\)', ' ', desc)          # remove parentheticals
+    clean = re.sub(
+        r'\b(monin|syrup|sauce|organic|natural|zero|sugar|free|ltr|pet|glass|pump|wh|org|sf)\b',
+        ' ', clean
+    )
+    clean = re.sub(r'\b\d+\w*\b', ' ', clean)        # remove numeric tokens (750ml, 64oz, etc.)
+    clean = re.sub(r'[()\/]', ' ', clean)
+    clean = re.sub(r'\s+', ' ', clean).strip()
+
+    stop = {'the', 'and', 'for', 'all'}
+    flavor_words = [w for w in clean.split() if len(w) > 2 and w not in stop]
+    if not flavor_words:
+        return None
+
+    best_code  = None
+    best_score = 0
+
+    for code, item_desc in ITEM_LOOKUP.items():
+        il = item_desc.lower()
+
+        # Type filters
+        if is_organic != ('organic' in il):
+            continue
+        if is_nz != ('natural zero' in il):
+            continue
+        has_sf = bool(re.search(r'\bsf\b', il)) or 'sugar free' in il
+        if is_sf != has_sf:
+            continue
+
+        # Size filter
+        if is_750 and '750' not in il:
+            continue
+        if is_64 and '64' not in il:
+            continue
+        if not is_750 and not is_64 and '750' not in il:
+            continue  # default to 750 mL when no size hint
+
+        # Pack filters (includes 4pk for 64oz cases)
+        item_12pk = '12pk' in il or '12 pk' in il
+        item_6pk  = '6pk'  in il or '6 pk'  in il
+        item_4pk  = '4pk'  in il or '4 pk'  in il
+        item_unit = not item_12pk and not item_6pk and not item_4pk
+
+        if is_12pk and not item_12pk: continue
+        if is_6pk  and not item_6pk:  continue
+        if is_unit and (item_12pk or item_6pk or item_4pk): continue
+
+        score = sum(1 for w in flavor_words if w in il)
+        if score > best_score:
+            best_score = score
+            best_code  = code
+
+    return best_code if best_score > 0 else None
+
+
+def _parse_houstons_dmcb(pdf, cfg, customer_ref, ref_num, inv_date):
+    """Parse Houston's DMCB chargeback detail from pages 2+.
+
+    CHEFSTORE section header includes 'Deduction Amount' column;
+    URM section does not.  Net = Chargeback Amount − Deduction Amount.
+    """
+    from collections import defaultdict
+    totals_qty = defaultdict(float)
+    totals_amt = defaultdict(float)
+
+    program_num = cfg.get('program_num', '')
+    dist_id     = cfg.get('dist_id',     '')
+    trade       = cfg.get('trade',       'D')
+
+    # Row starts with item# (NN-NNNN) then M-code then MONIN
+    item_row_pat = re.compile(r'^(\d{2}-\d{4})\s+(\S+)\s+MONIN\b', re.I)
+
+    has_deduction = False
+    in_data       = False
+
+    for pg in pdf.pages[1:]:          # skip page 1 (summary)
+        text  = (pg.extract_text() or '')
+        lines = text.split('\n')
+
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            # Column header line — detect whether Deduction Amount column present
+            if 'Vendor Item #' in line and 'Description' in line:
+                has_deduction = 'Deduction Amount' in line
+                in_data       = True
+                continue
+            if not in_data:
+                continue
+            # Skip section/subtotal lines
+            if re.match(r'^(Subtotal|Total\s|NO MATCH|PORTLAND|KANSAS CITY|Chargeback$)',
+                        line, re.I):
+                continue
+
+            m = item_row_pat.match(line)
+            if not m:
+                continue
+
+            item_code = m.group(2).upper()
+
+            # All currency-style numbers on the line
+            nums = re.findall(r'(?<!\d)[\d,]*\d+\.\d{2}(?!\d)', line)
+            if not nums:
+                continue
+
+            # Qty: first integer after the M-code and "MONIN"
+            qty_m = re.search(
+                rf'{re.escape(m.group(2))}\s+MONIN\s+.+?\s+(\d+)\s+[\d,]+\.\d{{2}}',
+                line, re.I
+            )
+            qty = int(qty_m.group(1)) if qty_m else 0
+
+            if has_deduction and len(nums) >= 2:
+                chargeback = float(nums[-2].replace(',', ''))
+                deduction  = float(nums[-1].replace(',', ''))
+                net = chargeback - deduction
+            else:
+                net = float(nums[-1].replace(',', ''))
+
+            totals_qty[item_code] += qty
+            totals_amt[item_code] += net
+
+    if not totals_amt:
+        return [{'_error': f"Houston's DMCB: no product rows found. Ref: {ref_num}"}]
+
+    rows = []
+    for item_code, amt in sorted(totals_amt.items()):
+        if amt == 0:
+            continue
+        rows.append(make_row(
+            source="Houston's Inc.",
+            program_num=program_num,
+            customer_ref=customer_ref or ref_num,
+            dist_id=dist_id,
+            bill_date=inv_date,
+            start_date=inv_date,
+            end_date=inv_date,
+            item=item_code,
+            qty=totals_qty[item_code],
+            amount=round(amt, 2),
+            trade=trade,
+        ))
+    return rows
+
+
+def _parse_houstons_dmi(page1_text, cfg, customer_ref, ref_num, inv_date):
+    """Parse Houston's DMI simple debit from page-1 line items.
+
+    Format: -qty  item#  vendor_item#  MONIN description  price  (net_amount)
+    """
+    program_num = cfg.get('program_num', '')
+    dist_id     = cfg.get('dist_id',     '')
+    trade       = cfg.get('trade',       'D')
+
+    # -qty  01-XXXX  M-CODE  MONIN ...description...  price  (net)
+    line_pat = re.compile(
+        r'^(-?[\d,]+)\s+\d{2}-\d{4}\s+(\S+)\s+MONIN\b.+?[\d.]+\s+\(([\d,]+\.?\d*)\)\s*$',
+        re.MULTILINE
+    )
+
+    rows = []
+    for m in line_pat.finditer(page1_text):
+        item_code = m.group(2).upper()
+        qty       = abs(float(m.group(1).replace(',', '')))
+        net_amt   = float(m.group(3).replace(',', ''))
+        rows.append(make_row(
+            source="Houston's Inc.",
+            program_num=program_num,
+            customer_ref=customer_ref or ref_num,
+            dist_id=dist_id,
+            bill_date=inv_date,
+            start_date=inv_date,
+            end_date=inv_date,
+            item=item_code,
+            qty=int(qty),
+            amount=net_amt,
+            trade=trade,
+        ))
+
+    if not rows:
+        total_m   = re.search(r'Total:\s*\$\s*\(?\s*([\d,]+\.?\d*)', page1_text)
+        total_amt = float(total_m.group(1).replace(',', '')) if total_m else 0.0
+        return [{'_error': (
+            f"Houston's DMI: no M-code line items parsed. "
+            f"Total: ${total_amt:.2f}. Ref: {ref_num}. Please enter manually."
+        )}]
+    return rows
+
+
+def _parse_houstons_petes(pdf, cfg, customer_ref, ref_num, inv_date):
+    """Parse Houston's Pete's Milk Delivery QuickBooks 'Sales by Item Detail'.
+
+    Extracts  Total NNNNN - Flavor (Description)  qty  price  total  lines
+    from pages 2+ and attempts to match description → M-code via ITEM_LOOKUP.
+    """
+    from collections import defaultdict
+    program_num = cfg.get('program_num', '')
+    dist_id     = cfg.get('dist_id',     '')
+    trade       = cfg.get('trade',       'D')
+
+    totals_qty   = defaultdict(float)
+    totals_amt   = defaultdict(float)
+    code_to_mcode = {}
+
+    # Total 56068 - Vanilla (Monin Vanilla Syrup 750ml)  qty  price  total
+    # Also handles: Total 56003 (Monin Caramel Sauce 64oz)  qty  price  total  (no "- Flavor" part)
+    total_pat = re.compile(
+        r'^Total\s+(\d+)\s*(?:-\s*[^(]+)?\(([^)]+)\)\s+([\d.,]+)\s+[\d.,]+\s+([\d.,]+)\s*$',
+        re.MULTILINE
+    )
+
+    for pg in pdf.pages[1:]:
+        text = pg.extract_text() or ''
+        for m in total_pat.finditer(text):
+            prod_code   = m.group(1)
+            description = m.group(2).strip()
+            qty         = float(m.group(3))
+            total_val   = float(m.group(4))
+
+            if prod_code not in code_to_mcode:
+                code_to_mcode[prod_code] = _match_houstons_desc(description, pack='U')
+
+            mcode = code_to_mcode[prod_code]
+            key   = mcode if mcode else f'UNMATCHED:{prod_code}:{description}'
+            totals_qty[key] += qty
+            totals_amt[key] += total_val
+
+    rows = []
+    for key, amt in sorted(totals_amt.items()):
+        if key.startswith('UNMATCHED:'):
+            _, code, desc = key.split(':', 2)
+            rows.append({'_error': (
+                f"Pete's Milk item {code} ('{desc}') — no M-code match found. "
+                f"Amount: ${amt:.2f}. Please enter manually."
+            )})
+        else:
+            rows.append(make_row(
+                source="Houston's Inc.",
+                program_num=program_num,
+                customer_ref=customer_ref or ref_num,
+                dist_id=dist_id,
+                bill_date=inv_date,
+                start_date=inv_date,
+                end_date=inv_date,
+                item=key,
+                qty=int(round(totals_qty[key])),
+                amount=round(amt, 2),
+                trade=trade,
+            ))
+
+    if not rows:
+        rows = [{'_error': f"Houston's Pete's Milk: no Total item lines found. Ref: {ref_num}"}]
+    return rows
+
+
+def _parse_houstons_medosweet(pdf, cfg, customer_ref, ref_num, inv_date):
+    """Parse Houston's Medosweet Billback Review Sales Performance Report.
+
+    Pages 2+ contain rows in two forms:
+      FULL:         [order#] [date] prod_code MONIN description qty weight cube amount rate U extended [AP APvoucher]
+      CONTINUATION: order# [date] qty weight cube amount rate U extended [AP APvoucher]
+                    (same item code as the previous full row — no MONIN description)
+
+    Stateful parser tracks current_item_code across lines so continuation rows
+    are attributed to the correct M-code.  cube may be 0 or non-zero.
+    """
+    from collections import defaultdict
+    program_num = cfg.get('program_num', '')
+    dist_id     = cfg.get('dist_id',     '')
+    trade       = cfg.get('trade',       'D')
+
+    totals_qty    = defaultdict(float)
+    totals_amt    = defaultdict(float)
+    code_to_mcode = {}   # prod_code (str) → M-code (str | None)
+
+    # Full row: ...prod_code MONIN desc... qty weight cube amount rate U extended [AP APvoucher]
+    # Non-greedy .+? stops before the trailing number block.
+    item_with_code_pat = re.compile(
+        r'\b(\d{4,5})\s+(MONIN\b.+?)'
+        r'\s+(\d+)\s+\d+\s+\d+\s+[\d,]+\.\d+\s+[\d.]+\s+U\s+([\d.]+)',
+        re.I
+    )
+
+    # Extended amount from any data line — the number immediately after "U "
+    extended_pat = re.compile(r'\bU\s+([\d.]+)(?:\s+AP\s+AP\d+)?\s*$', re.I)
+
+    # Qty from a continuation line: 7-digit order# [date] qty weight cube amount ...
+    cont_qty_pat = re.compile(
+        r'^\d{7}\s+(?:\d{1,2}/\d{1,2}/\d{4}\s+)?(\d+)\s+\d+\s+\d+\s+[\d,]+\.\d+'
+    )
+
+    # Lines to skip unconditionally
+    skip_pat = re.compile(
+        r'^(?:Order|Number|Date|Product|Report|Group|Selection|Billback|Page\b'
+        r'|\d{2}-MEDOSWEET|Detail for |Total For |Total for )',
+        re.I
+    )
+
+    current_item_code = None   # M-code string, carried across lines
+
+    for pg in pdf.pages[1:]:
+        text  = pg.extract_text() or ''
+        lines = text.split('\n')
+
+        for line in lines:
+            line = line.strip()
+            if not line or skip_pat.match(line):
+                continue
+
+            # ── Full row (has item code + MONIN description) ──────────────────
+            ic_m = item_with_code_pat.search(line)
+            if ic_m:
+                prod_code   = ic_m.group(1)
+                description = ic_m.group(2).strip()
+                qty         = int(ic_m.group(3))
+                extended    = float(ic_m.group(4))
+
+                # Resolve prod_code → M-code (cache result)
+                if prod_code not in code_to_mcode:
+                    desc_up = description.upper()
+                    pack = '12pk' if '12/CS' in desc_up else ('6pk' if '6/CS' in desc_up else '')
+                    code_to_mcode[prod_code] = _match_houstons_desc(description, pack)
+
+                current_item_code = code_to_mcode[prod_code]
+                key = current_item_code if current_item_code else f'UNMATCHED:{prod_code}:{description}'
+                totals_qty[key] += qty
+                totals_amt[key] += extended
+                continue
+
+            # ── Continuation row (no item code) ───────────────────────────────
+            if current_item_code is None:
+                continue   # can't attribute without a known item
+
+            ext_m = extended_pat.search(line)
+            if not ext_m:
+                continue
+
+            extended = float(ext_m.group(1))
+            qty_m    = cont_qty_pat.match(line)
+            qty      = int(qty_m.group(1)) if qty_m else 0
+
+            totals_qty[current_item_code] += qty
+            totals_amt[current_item_code] += extended
+
+    rows = []
+    for key, amt in sorted(totals_amt.items()):
+        if key.startswith('UNMATCHED:'):
+            _, code, desc = key.split(':', 2)
+            rows.append({'_warning': (
+                f"Medosweet item {code} ('{desc}') — no M-code match found. "
+                f"Amount: ${amt:.2f}. Please enter manually."
+            )})
+        else:
+            rows.append(make_row(
+                source="Houston's Inc.",
+                program_num=program_num,
+                customer_ref=customer_ref or ref_num,
+                dist_id=dist_id,
+                bill_date=inv_date,
+                start_date=inv_date,
+                end_date=inv_date,
+                item=key,
+                qty=int(round(totals_qty[key])),
+                amount=round(amt, 2),
+                trade=trade,
+            ))
+
+    if not rows:
+        rows = [{'_error': f"Houston's Medosweet: no product rows found. Ref: {ref_num}"}]
+    return rows
+
+
+def parse_houstons(filepath, cfg, customer_ref):
+    """Parse Houston's Inc. Debit Memo PDFs.
+
+    Sub-formats dispatched by reference number prefix and page-1 keywords:
+      DMCB  — Chargeback report; M-code detail table on pages 2+
+      DMI   — Simple shortage debit; M-code line items on page 1
+      DMOR  — Oregon/WA regional rebate; no per-item M-codes → warning
+      DM-*  with 'Pete'+'Milk'  → Pete's Milk QuickBooks Sales by Item Detail
+      DM-*  with 'Medosweet'   → Medosweet Billback Sales Performance Report
+      DM-*  with 'Two Valleys' → Two Valleys distributor report → warning
+      DM-*  with 'EK Beverage'/'TOP POT' → EK Beverage rebate → warning
+    """
+    rows = []
+    try:
+        with pdfplumber.open(filepath) as pdf:
+            page1_text = pdf.pages[0].extract_text() or ''
+
+            # Reference number — look for "Reference# DMXXX-..." on page 1
+            # Avoid matching "Vendor Inv# or Reference#" by anchoring to "Reference#"
+            ref_m  = re.search(r'Reference#\s+(\S+)', page1_text, re.I)
+            if not ref_m:
+                ref_m = re.search(r'Inv#:\s+(\S+)', page1_text, re.I)
+            ref_num = ref_m.group(1).rstrip(',') if ref_m else ''
+
+            # Invoice date  MM/DD/YY or MM/DD/YYYY
+            date_m   = re.search(
+                r'(?:Inv\s+date|Date):\s*(\d{1,2}/\d{1,2}/\d{2,4})',
+                page1_text, re.I
+            )
+            inv_date = to_yyyymmdd(date_m.group(1)) if date_m else ''
+
+            # Total deduction amount from page 1 (for warning messages)
+            total_m   = re.search(r'Total:\s*\$\s*\(?\s*([\d,]+\.?\d*)', page1_text, re.I)
+            total_amt = float(total_m.group(1).replace(',', '')) if total_m else 0.0
+
+            ref_upper = ref_num.upper()
+            p1_upper  = page1_text.upper()
+
+            if ref_upper.startswith('DMCB'):
+                rows = _parse_houstons_dmcb(pdf, cfg, customer_ref, ref_num, inv_date)
+            elif ref_upper.startswith('DMI'):
+                rows = _parse_houstons_dmi(page1_text, cfg, customer_ref, ref_num, inv_date)
+            elif ref_upper.startswith('DMOR') or 'OREGON CASES' in p1_upper:
+                rows = [{'_error': (
+                    f"Houston's DMOR — Oregon/WA regional rebate, no per-item M-codes. "
+                    f"Total: ${total_amt:.2f}. Ref: {ref_num}. Please enter manually."
+                )}]
+            elif 'EK BEVERAGE' in p1_upper or 'TOP POT REBATE' in p1_upper:
+                rows = [{'_error': (
+                    f"Houston's EK Beverage/Top Pot Rebate — no per-item M-codes. "
+                    f"Total: ${total_amt:.2f}. Ref: {ref_num}. Please enter manually."
+                )}]
+            elif 'PETE' in p1_upper and 'MILK' in p1_upper:
+                rows = _parse_houstons_petes(pdf, cfg, customer_ref, ref_num, inv_date)
+            elif 'MEDOSWEET' in p1_upper:
+                rows = _parse_houstons_medosweet(pdf, cfg, customer_ref, ref_num, inv_date)
+            elif 'TWO VALLEYS' in p1_upper:
+                rows = [{'_error': (
+                    f"Houston's Two Valleys — distributor report, no per-item M-codes. "
+                    f"Total: ${total_amt:.2f}. Ref: {ref_num}. Please enter manually."
+                )}]
+            else:
+                rows = [{'_error': (
+                    f"Houston's Debit Memo: unrecognized sub-format. "
+                    f"Total: ${total_amt:.2f}. Ref: {ref_num}. Please enter manually."
+                )}]
+    except Exception as e:
+        rows = [{'_error': f"Houston's parse error: {e}"}]
+    return rows
+
+
 def parse_harbor(filepath, cfg, customer_ref):
     """Harbor Foodservice 'Supplier Billback' — XLSX only; PDFs routed by content."""
     if filepath.lower().endswith('.pdf'):
@@ -4182,6 +4663,8 @@ def detect_and_parse(filepath, user_config=None, customer_ref='', file_override=
         return _ret(supplier, parse_driscoll(filepath, cfg, customer_ref))
     elif supplier == 'CHENEY':
         return _ret(supplier, parse_cheney(filepath, cfg, customer_ref))
+    elif supplier == 'HOUSTONS':
+        return _ret(supplier, parse_houstons(filepath, cfg, customer_ref))
     elif supplier == 'BLAIR_CANDY':
         return supplier, [{'_error': 'Blair Candy uses scanned/image PDFs — text extraction not supported. Please enter manually.'}]
     else:
@@ -4522,6 +5005,7 @@ function detectSupplier(filename) {
   if (/Y[\s.]?HATA|Y_HATA/.test(fn)) return 'Y_HATA';
   if (fn.includes('DRISCOLL')) return 'DRISCOLL';
   if (fn.includes('KOHL')) return 'KOHL_WH';
+  if (/^DM(?:CB|I\d|OR|-|TOPOT|TOPPOT)/.test(fn)) return 'HOUSTONS';
   if (fn.includes('DELCO')) return 'DELCO_FOODS';
   if (/CHEFS.{0,6}WH|CHEFSWAREHOUSE|DAIRYLAND/.test(fn)) return 'CHEFS_WH';
   if (fn.includes('HARBOR') || fn.includes('SUPPLIER BILLBACK') || fn.includes('SUPPLIER_BILLBACK')) return 'HARBOR';
@@ -4555,6 +5039,7 @@ function distNameToKey(name) {
   if (u.includes('CHEFSWAREHOUSE') || u.includes('CHEFSWHSE') || u.includes('DAIRYLAND') || u.includes('CHEFSW')) return 'CHEFS_WH';
   if (u.includes('ATLAS')) return 'ATLAS';
   if (u.includes('KOHL')) return 'KOHL_WH';
+  if (u.includes('HOUSTON')) return 'HOUSTONS';
   // Everything else: route through content-based PDF dispatcher (don't force Harbor)
   return 'UNKNOWN';
 }
@@ -4571,6 +5056,7 @@ const KEY_TO_DISPLAY = {
   CHEFS_WH:'The Chefs Warehouse',
   ATLAS:'Atlas Wholesale Food',
   KOHL_WH:'Kohl Wholesale',
+  HOUSTONS:"Houstons",
   BLAIR_CANDY:'Blair Candy', UNKNOWN:''
 };
 
