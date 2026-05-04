@@ -4560,10 +4560,22 @@ def parse_houstons(filepath, cfg, customer_ref):
             elif ref_upper.startswith('DMI'):
                 rows = _parse_houstons_dmi(page1_text, cfg, customer_ref, ref_num, inv_date)
             elif ref_upper.startswith('DMOR') or 'OREGON CASES' in p1_upper:
-                rows = [{'_error': (
-                    f"Houston's DMOR — Oregon/WA regional rebate, no per-item M-codes. "
-                    f"Total: ${total_amt:.2f}. Ref: {ref_num}. Please enter manually."
-                )}]
+                # Lump sum — no per-item breakdown; single row with total amount
+                row = make_row(
+                    source="Houston's Inc.",
+                    program_num=cfg.get('program_num', ''),
+                    customer_ref=customer_ref or ref_num,
+                    dist_id=cfg.get('dist_id', ''),
+                    bill_date=inv_date,
+                    start_date=start_date or inv_date,
+                    end_date=end_date or inv_date,
+                    item='',
+                    qty=0,
+                    amount=round(total_amt, 2),
+                    trade=cfg.get('trade', 'D'),
+                )
+                row['Lump Sum Indicator'] = 'Y'
+                rows = [row]
             elif 'EK BEVERAGE' in p1_upper or 'TOP POT REBATE' in p1_upper:
                 rows = _parse_houstons_toppot(
                     pdf, cfg, customer_ref, ref_num, inv_date, start_date, end_date
