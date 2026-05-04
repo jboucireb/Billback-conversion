@@ -1819,7 +1819,9 @@ def make_row(source='', program_num='', customer_ref='', dist_id='',
     dist_id_raw = str(dist_id).strip()
     dist_id_int = dist_id_raw if dist_id_raw else None  # always string — preserves leading zeros
     try:
-        qty_int = round(float(str(qty))) if qty not in ('', None) else 0
+        qty_val = float(str(qty)) if qty not in ('', None) else 0
+        # Keep as integer if it is a whole number, otherwise preserve up to 3 decimal places
+        qty_int = int(qty_val) if qty_val == int(qty_val) else round(qty_val, 3)
     except:
         qty_int = 0
     try:
@@ -3978,11 +3980,13 @@ def _match_houstons_desc(description, pack=''):
 
     is_12pk = pack in ('12pk', 'A', '12')
     is_6pk  = pack in ('6pk',  'B', '6')
-    is_unit = not is_12pk and not is_6pk  # single unit (750 mL or 64 oz)
+    is_4pk  = pack in ('4pk',  '4')
+    is_unit = not is_12pk and not is_6pk and not is_4pk
 
-    # Detect size from description
-    is_750 = '750' in desc
-    is_64  = ('64' in desc or 'oz' in desc) and not is_750
+    # Detect size from description — be precise to avoid 12oz matching as 64oz
+    is_750  = '750' in desc
+    is_64   = '64' in desc and not is_750                          # explicitly 64oz
+    is_12oz = bool(re.search(r'\b12\s*oz\b', desc)) and not is_750 and not is_64  # 12oz sauce
 
     # Clean description for flavor extraction
     clean = re.sub(r'\([^)]*\)', ' ', desc)          # remove parentheticals
@@ -4019,10 +4023,12 @@ def _match_houstons_desc(description, pack=''):
             continue
         if is_64 and '64' not in il:
             continue
-        if not is_750 and not is_64 and '750' not in il:
+        if is_12oz and not any(x in il for x in ['12oz', '12 oz', '12fl', '6pk-12']):
+            continue
+        if not is_750 and not is_64 and not is_12oz and '750' not in il:
             continue  # default to 750 mL when no size hint
 
-        # Pack filters (includes 4pk for 64oz cases)
+        # Pack filters
         item_12pk = '12pk' in il or '12 pk' in il
         item_6pk  = '6pk'  in il or '6 pk'  in il
         item_4pk  = '4pk'  in il or '4 pk'  in il
@@ -4030,6 +4036,7 @@ def _match_houstons_desc(description, pack=''):
 
         if is_12pk and not item_12pk: continue
         if is_6pk  and not item_6pk:  continue
+        if is_4pk  and not item_4pk:  continue
         if is_unit and (item_12pk or item_6pk or item_4pk): continue
 
         score = sum(1 for w in flavor_words if w in il)
@@ -4175,12 +4182,148 @@ def _parse_houstons_dmi(page1_text, cfg, customer_ref, ref_num, inv_date):
     return rows
 
 
-def _parse_houstons_petes(pdf, cfg, customer_ref, ref_num, inv_date):
+def _extract_claim_period(page1_text):
+    """Extract (start_date, end_date) as YYYYMMDD from an explanation sentence.
+
+    Looks for a month name + year in the explanation text, e.g.:
+      'Monin Caffe Vita - January 2026.'
+      'EK Beverage sales during February 2026.'
+      'January 2026 program'
+    Returns (start_date, end_date) or (None, None) if not found.
+    """
+    import calendar
+    months = {
+        'january': 1, 'february': 2, 'march': 3, 'april': 4,
+        'may': 5, 'june': 6, 'july': 7, 'august': 8,
+        'september': 9, 'october': 10, 'november': 11, 'december': 12,
+    }
+    text_l = page1_text.lower()
+    for month_name, month_num in months.items():
+        if month_name not in text_l:
+            continue
+        # Look for a 4-digit year near this month name
+        idx = text_l.index(month_name)
+        nearby = text_l[max(0, idx - 10): idx + len(month_name) + 20]
+        yr_m = re.search(r'\b(20\d{2})\b', nearby)
+        if not yr_m:
+            continue
+        year = int(yr_m.group(1))
+        last_day = calendar.monthrange(year, month_num)[1]
+        start = f'{year}{month_num:02d}01'
+        end   = f'{year}{month_num:02d}{last_day:02d}'
+        return start, end
+    return None, None
+
+
+def _parse_houstons_toppot(pdf, cfg, customer_ref, ref_num, inv_date, start_date, end_date):
+    """Parse EK Beverage / Top Pot Retail Price Incentives invoice (page 2).
+
+    Format (page 2):
+      Program: Retail Price Incentives ...
+      <Customer name>
+      <Description>  <Qty>  $<Amount>  $<SubTotal>  <CoOp%>  $<Total>
+      ...
+      Sub-Total: $X
+      Total: $X
+
+    Description → M-code via _match_houstons_desc.
+    '750ml (Reg & SF)' bundles regular + SF and cannot be auto-matched → warning.
+    """
+    from collections import defaultdict
+    program_num = cfg.get('program_num', '')
+    dist_id     = cfg.get('dist_id',     '')
+    trade       = cfg.get('trade',       'D')
+
+    rows = []
+
+    # Line pattern: Description  Qty  $Amount  $SubTotal  CoOp%  $Total
+    # Only capture lines where Total > 0 (skip zero-dollar lines)
+    line_pat = re.compile(
+        r'^(.+?)\s+(\d+)\s+\$[\d,]+\.\d+\s+\$([\d,]+\.\d+)\s+\d+%\s+\$([\d,]+\.\d+)\s*$'
+    )
+
+    for pg in pdf.pages[1:]:
+        text  = pg.extract_text() or ''
+        lines = text.split('\n')
+        in_program = False
+
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            if 'Program:' in line and 'Price Incentive' in line:
+                in_program = True
+                continue
+            if not in_program:
+                continue
+            if re.match(r'(Sub-Total|Total:|Check|For Office)', line, re.I):
+                continue
+
+            m = line_pat.match(line)
+            if not m:
+                continue
+
+            description = m.group(1).strip()
+            qty         = int(m.group(2))
+            total       = float(m.group(4).replace(',', ''))
+
+            if qty == 0 or total == 0:
+                continue
+
+            # Determine size/pack from description
+            desc_l = description.lower()
+            if '12oz' in desc_l or '12 oz' in desc_l:
+                pack = '6pk'   # 12oz sauces come in 6-packs
+            elif '64oz' in desc_l or '64 oz' in desc_l:
+                pack = '4pk'   # 64oz sauces come in 4-packs
+            elif '750ml' in desc_l or '750 ml' in desc_l:
+                pack = '12pk'
+            else:
+                pack = ''
+
+            # "750ml (Reg & SF)" bundles two products — can't auto-match
+            if re.search(r'reg\s*&\s*sf', desc_l):
+                rows.append({'_warning': (
+                    f"Top Pot '750ml (Reg & SF)': {qty} cases, ${total:.2f} — "
+                    f"bundles regular + sugar free 750ml. Please split and enter manually."
+                )})
+                continue
+
+            mcode = _match_houstons_desc(description, pack)
+            if mcode:
+                rows.append(make_row(
+                    source="Houston's Inc.",
+                    program_num=program_num,
+                    customer_ref=customer_ref or ref_num,
+                    dist_id=dist_id,
+                    bill_date=inv_date,
+                    start_date=start_date or inv_date,
+                    end_date=end_date or inv_date,
+                    item=mcode,
+                    qty=qty,
+                    amount=round(total, 2),
+                    trade=trade,
+                ))
+            else:
+                rows.append({'_warning': (
+                    f"Top Pot '{description}': {qty} cases, ${total:.2f} — "
+                    f"no M-code match. Please enter manually."
+                )})
+
+    if not rows:
+        rows = [{'_error': f"Houston's Top Pot: no product rows found. Ref: {ref_num}"}]
+    return rows
+
+
+def _parse_houstons_petes(pdf, cfg, customer_ref, ref_num, inv_date,
+                          start_date=None, end_date=None):
     """Parse Houston's Pete's Milk Delivery QuickBooks 'Sales by Item Detail'.
 
     Extracts  Total NNNNN - Flavor (Description)  qty  price  total  lines
     from pages 2+ and attempts to match description → M-code via ITEM_LOOKUP.
     """
+    start_date = start_date or inv_date
+    end_date   = end_date   or inv_date
     from collections import defaultdict
     program_num = cfg.get('program_num', '')
     dist_id     = cfg.get('dist_id',     '')
@@ -4228,8 +4371,8 @@ def _parse_houstons_petes(pdf, cfg, customer_ref, ref_num, inv_date):
                 customer_ref=customer_ref or ref_num,
                 dist_id=dist_id,
                 bill_date=inv_date,
-                start_date=inv_date,
-                end_date=inv_date,
+                start_date=start_date,
+                end_date=end_date,
                 item=key,
                 qty=int(round(totals_qty[key])),
                 amount=round(amt, 2),
@@ -4241,7 +4384,8 @@ def _parse_houstons_petes(pdf, cfg, customer_ref, ref_num, inv_date):
     return rows
 
 
-def _parse_houstons_medosweet(pdf, cfg, customer_ref, ref_num, inv_date):
+def _parse_houstons_medosweet(pdf, cfg, customer_ref, ref_num, inv_date,
+                              start_date=None, end_date=None):
     """Parse Houston's Medosweet Billback Review Sales Performance Report.
 
     Pages 2+ contain rows in two forms:
@@ -4251,7 +4395,10 @@ def _parse_houstons_medosweet(pdf, cfg, customer_ref, ref_num, inv_date):
 
     Stateful parser tracks current_item_code across lines so continuation rows
     are attributed to the correct M-code.  cube may be 0 or non-zero.
+    Quantities in the PDF are bottles — converted to cases (÷12 or ÷6) before output.
     """
+    start_date = start_date or inv_date
+    end_date   = end_date   or inv_date
     from collections import defaultdict
     program_num = cfg.get('program_num', '')
     dist_id     = cfg.get('dist_id',     '')
@@ -4285,6 +4432,7 @@ def _parse_houstons_medosweet(pdf, cfg, customer_ref, ref_num, inv_date):
     )
 
     current_item_code = None   # M-code string, carried across lines
+    current_cs_size   = 1      # bottles-per-case for current item (12 or 6)
 
     for pg in pdf.pages[1:]:
         text  = pg.extract_text() or ''
@@ -4300,18 +4448,24 @@ def _parse_houstons_medosweet(pdf, cfg, customer_ref, ref_num, inv_date):
             if ic_m:
                 prod_code   = ic_m.group(1)
                 description = ic_m.group(2).strip()
-                qty         = int(ic_m.group(3))
+                qty_bottles = int(ic_m.group(3))   # Medosweet reports bottles, not cases
                 extended    = float(ic_m.group(4))
 
-                # Resolve prod_code → M-code (cache result)
+                # Resolve prod_code → M-code + case size (cache result)
                 if prod_code not in code_to_mcode:
                     desc_up = description.upper()
-                    pack = '12pk' if '12/CS' in desc_up else ('6pk' if '6/CS' in desc_up else '')
-                    code_to_mcode[prod_code] = _match_houstons_desc(description, pack)
+                    if '12/CS' in desc_up:
+                        pack = '12pk';  cs_size = 12
+                    elif '6/CS' in desc_up:
+                        pack = '6pk';   cs_size = 6
+                    else:
+                        pack = '';      cs_size = 1
+                    code_to_mcode[prod_code] = (_match_houstons_desc(description, pack), cs_size)
 
-                current_item_code = code_to_mcode[prod_code]
+                current_item_code, current_cs_size = code_to_mcode[prod_code]
                 key = current_item_code if current_item_code else f'UNMATCHED:{prod_code}:{description}'
-                totals_qty[key] += qty
+                # Convert bottles → cases
+                totals_qty[key] += qty_bottles / current_cs_size
                 totals_amt[key] += extended
                 continue
 
@@ -4323,11 +4477,11 @@ def _parse_houstons_medosweet(pdf, cfg, customer_ref, ref_num, inv_date):
             if not ext_m:
                 continue
 
-            extended = float(ext_m.group(1))
-            qty_m    = cont_qty_pat.match(line)
-            qty      = int(qty_m.group(1)) if qty_m else 0
+            extended    = float(ext_m.group(1))
+            qty_m       = cont_qty_pat.match(line)
+            qty_bottles = int(qty_m.group(1)) if qty_m else 0
 
-            totals_qty[current_item_code] += qty
+            totals_qty[current_item_code] += qty_bottles / current_cs_size
             totals_amt[current_item_code] += extended
 
     rows = []
@@ -4345,10 +4499,10 @@ def _parse_houstons_medosweet(pdf, cfg, customer_ref, ref_num, inv_date):
                 customer_ref=customer_ref or ref_num,
                 dist_id=dist_id,
                 bill_date=inv_date,
-                start_date=inv_date,
-                end_date=inv_date,
+                start_date=start_date,
+                end_date=end_date,
                 item=key,
-                qty=int(round(totals_qty[key])),
+                qty=round(totals_qty[key], 3),   # fractional cases (bottles÷pack)
                 amount=round(amt, 2),
                 trade=trade,
             ))
@@ -4389,6 +4543,11 @@ def parse_houstons(filepath, cfg, customer_ref):
             )
             inv_date = to_yyyymmdd(date_m.group(1)) if date_m else ''
 
+            # Claim period — first/last day of the month named in the explanation
+            start_date, end_date = _extract_claim_period(page1_text)
+            if not start_date:
+                start_date = end_date = inv_date  # fallback to invoice date
+
             # Total deduction amount from page 1 (for warning messages)
             total_m   = re.search(r'Total:\s*\$\s*\(?\s*([\d,]+\.?\d*)', page1_text, re.I)
             total_amt = float(total_m.group(1).replace(',', '')) if total_m else 0.0
@@ -4406,14 +4565,17 @@ def parse_houstons(filepath, cfg, customer_ref):
                     f"Total: ${total_amt:.2f}. Ref: {ref_num}. Please enter manually."
                 )}]
             elif 'EK BEVERAGE' in p1_upper or 'TOP POT REBATE' in p1_upper:
-                rows = [{'_error': (
-                    f"Houston's EK Beverage/Top Pot Rebate — no per-item M-codes. "
-                    f"Total: ${total_amt:.2f}. Ref: {ref_num}. Please enter manually."
-                )}]
+                rows = _parse_houstons_toppot(
+                    pdf, cfg, customer_ref, ref_num, inv_date, start_date, end_date
+                )
             elif 'PETE' in p1_upper and 'MILK' in p1_upper:
-                rows = _parse_houstons_petes(pdf, cfg, customer_ref, ref_num, inv_date)
+                rows = _parse_houstons_petes(
+                    pdf, cfg, customer_ref, ref_num, inv_date, start_date, end_date
+                )
             elif 'MEDOSWEET' in p1_upper:
-                rows = _parse_houstons_medosweet(pdf, cfg, customer_ref, ref_num, inv_date)
+                rows = _parse_houstons_medosweet(
+                    pdf, cfg, customer_ref, ref_num, inv_date, start_date, end_date
+                )
             elif 'TWO VALLEYS' in p1_upper:
                 rows = [{'_error': (
                     f"Houston's Two Valleys — distributor report, no per-item M-codes. "
