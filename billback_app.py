@@ -5626,14 +5626,37 @@ async function processFiles() {
   form.append('config', JSON.stringify(config));
   form.append('file_overrides', JSON.stringify(fileOverrides));
 
-  fill.style.width = '30%';
+  fill.style.width = '20%';
   ptxt.textContent = 'Uploading files...';
 
   try {
     const resp = await fetch('/process', {method:'POST', body: form});
-    fill.style.width = '70%';
-    ptxt.textContent = 'Generating Tellus file...';
-    const data = await resp.json();
+    const init = await resp.json();
+
+    // If server returned a job_id, poll for completion
+    let data;
+    if (init.job_id) {
+      fill.style.width = '40%';
+      ptxt.textContent = 'Processing files…';
+      let dots = 0;
+      data = await new Promise((resolve, reject) => {
+        const poll = setInterval(async () => {
+          try {
+            dots = (dots + 1) % 4;
+            ptxt.textContent = 'Processing files' + '.'.repeat(dots + 1);
+            const sr = await fetch('/status/' + init.job_id, {method:'POST', body: ''});
+            const s  = await sr.json();
+            if (s.status === 'done' || s.status === 'error') {
+              clearInterval(poll);
+              resolve(s);
+            }
+          } catch(e) { clearInterval(poll); reject(e); }
+        }, 2000);
+      });
+    } else {
+      data = init;
+    }
+
     fill.style.width = '100%';
 
     let html = '';
@@ -5726,8 +5749,13 @@ _downloads = {}   # id → bytes
 
 
 # ── Simple session-based auth (only active when APP_PASSWORD env var is set) ──
-import hashlib, secrets as _secrets
+import hashlib, secrets as _secrets, threading
+from socketserver import ThreadingMixIn
 _active_sessions = set()  # set of valid session tokens
+
+# ── Async job queue ────────────────────────────────────────────────────────────
+_jobs      = {}   # job_id → {'status': 'processing'|'done'|'error', ...}
+_jobs_lock = threading.Lock()
 
 APP_PASSWORD = os.environ.get('APP_PASSWORD', '')  # set this on Render
 
@@ -5837,6 +5865,17 @@ class BillbackHandler(BaseHTTPRequestHandler):
         if not _is_authed(self.headers):
             self.send_response(403); self.end_headers(); return
 
+        # ── Job status poll ──────────────────────────────────────────────────
+        if self.path.startswith('/status/'):
+            job_id = self.path[len('/status/'):]
+            with _jobs_lock:
+                job = _jobs.get(job_id)
+            if job is None:
+                self._respond_json({'status': 'not_found'})
+            else:
+                self._respond_json(job)
+            return
+
         if self.path != '/process':
             self.send_response(404); self.end_headers(); return
         try:
@@ -5879,64 +5918,81 @@ class BillbackHandler(BaseHTTPRequestHandler):
                 elif field_name == 'files' and filename:
                     file_parts.append((filename, payload))
 
+            # Save uploaded files to a temp dir
             tmpdir = tempfile.mkdtemp()
-            results = []
-            all_rows = []
-
+            saved_parts = []
             for filename, content in file_parts:
-                # Save with original filename for supplier detection
                 safe_name = re.sub(r'[^\w.\-]', '_', filename)
                 tmp_path = os.path.join(tmpdir, safe_name)
                 with open(tmp_path, 'wb') as f:
                     f.write(content)
+                saved_parts.append((filename, tmp_path))
 
-                fo   = file_overrides.get(filename, {})
-                cref = fo.get('customer_ref', '')
+            # Create job and start background processing thread
+            job_id = str(uuid.uuid4())[:12]
+            with _jobs_lock:
+                _jobs[job_id] = {'status': 'processing'}
+
+            def _run_job(jid, parts, uconfig, foverrides, tdir):
+                results  = []
+                all_rows = []
                 try:
-                    supplier, rows = detect_and_parse(tmp_path, user_config, cref, file_override=fo, original_filename=filename)
-                    fatal_errs = [r['_error'] for r in rows if '_error' in r]
-                    warnings   = [r for r in rows if '_warning' in r]
-                    ok         = [r for r in rows if '_error' not in r and '_warning' not in r]
-                    all_rows.extend(ok)
-                    warn_total = round(sum(w['amount'] for w in warnings), 4)
-                    warn_list  = [f"{w['code']} — {w['desc']} (${w['amount']})" for w in warnings]
-                    if fatal_errs and not ok:
-                        results.append({'file': filename, 'supplier': supplier,
-                                        'error': fatal_errs[0], 'rows': 0,
-                                        'warnings': [], 'warn_total': 0,
-                                        'total_amount': 0.0, 'total_qty': 0})
-                    else:
-                        total_amount = round(sum(
-                            float(r.get('Item Dollar Amount') or 0) for r in ok), 2)
-                        total_qty = int(round(sum(
-                            float(r.get('Item Volume Qty') or 0) for r in ok)))
-                        results.append({'file': filename, 'supplier': supplier,
-                                        'rows': len(ok), 'error': None,
-                                        'warnings': warn_list, 'warn_total': warn_total,
-                                        'total_amount': total_amount, 'total_qty': total_qty})
+                    for fname, fpath in parts:
+                        fo   = foverrides.get(fname, {})
+                        cref = fo.get('customer_ref', '')
+                        try:
+                            supplier, rows = detect_and_parse(fpath, uconfig, cref, file_override=fo, original_filename=fname)
+                            fatal_errs = [r['_error'] for r in rows if '_error' in r]
+                            warnings   = [r for r in rows if '_warning' in r]
+                            ok         = [r for r in rows if '_error' not in r and '_warning' not in r]
+                            all_rows.extend(ok)
+                            warn_total = round(sum(w['amount'] for w in warnings), 4)
+                            warn_list  = [f"{w['code']} — {w['desc']} (${w['amount']})" for w in warnings]
+                            if fatal_errs and not ok:
+                                results.append({'file': fname, 'supplier': supplier,
+                                                'error': fatal_errs[0], 'rows': 0,
+                                                'warnings': [], 'warn_total': 0,
+                                                'total_amount': 0.0, 'total_qty': 0})
+                            else:
+                                total_amount = round(sum(float(r.get('Item Dollar Amount') or 0) for r in ok), 2)
+                                total_qty    = int(round(sum(float(r.get('Item Volume Qty') or 0) for r in ok)))
+                                results.append({'file': fname, 'supplier': supplier,
+                                                'rows': len(ok), 'error': None,
+                                                'warnings': warn_list, 'warn_total': warn_total,
+                                                'total_amount': total_amount, 'total_qty': total_qty})
+                        except Exception as ex:
+                            results.append({'file': fname, 'supplier': 'ERROR',
+                                            'error': str(ex), 'rows': 0,
+                                            'warnings': [], 'warn_total': 0})
+
+                    shutil.rmtree(tdir, ignore_errors=True)
+
+                    download_id = None
+                    if all_rows:
+                        xlsx_bytes  = build_output(all_rows)
+                        download_id = str(uuid.uuid4())[:8]
+                        _downloads[download_id] = xlsx_bytes
+
+                    with _jobs_lock:
+                        _jobs[jid] = {'status': 'done', 'results': results,
+                                      'download_id': download_id, 'total_rows': len(all_rows)}
                 except Exception as ex:
-                    results.append({'file': filename, 'supplier': 'ERROR',
-                                    'error': str(ex), 'rows': 0,
-                                    'warnings': [], 'warn_total': 0})
+                    shutil.rmtree(tdir, ignore_errors=True)
+                    with _jobs_lock:
+                        _jobs[jid] = {'status': 'error', 'error': str(ex),
+                                      'results': [], 'download_id': None, 'total_rows': 0}
 
-            shutil.rmtree(tmpdir, ignore_errors=True)
-
-            download_id = None
-            if all_rows:
-                xlsx_bytes = build_output(all_rows)
-                download_id = str(uuid.uuid4())[:8]
-                _downloads[download_id] = xlsx_bytes
-
-            resp = {'results': results, 'download_id': download_id,
-                    'total_rows': len(all_rows)}
-            self._respond_json(resp)
+            t = threading.Thread(target=_run_job,
+                                 args=(job_id, saved_parts, user_config, file_overrides, tmpdir),
+                                 daemon=True)
+            t.start()
+            self._respond_json({'job_id': job_id})
 
         except Exception as e:
             try:
                 self._respond_json({'error': str(e), 'trace': traceback.format_exc(),
                                     'results': [], 'download_id': None, 'total_rows': 0})
             except Exception:
-                # Last resort — connection may be broken; send a bare minimal body
                 try:
                     body = b'{"error":"Internal server error","results":[],"download_id":null,"total_rows":0}'
                     self.send_response(500)
@@ -5945,7 +6001,7 @@ class BillbackHandler(BaseHTTPRequestHandler):
                     self.end_headers()
                     self.wfile.write(body)
                 except Exception:
-                    pass  # Socket is dead; nothing we can do
+                    pass
 
     def _respond_json(self, data):
         body = json.dumps(data).encode()
@@ -5954,6 +6010,10 @@ class BillbackHandler(BaseHTTPRequestHandler):
         self.send_header('Content-Length', str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    """Handle each request in a separate thread so polling doesn't block processing."""
+    daemon_threads = True
 
 def run():
     # When deployed online (Render, Railway, etc.) use the PORT env var.
@@ -5964,7 +6024,7 @@ def run():
     if is_web:
         port = int(env_port)
         host = '0.0.0.0'
-        server = HTTPServer((host, port), BillbackHandler)
+        server = ThreadedHTTPServer((host, port), BillbackHandler)
         print(f'Monin Billback running on port {port}')
         try:
             server.serve_forever()
@@ -5975,7 +6035,7 @@ def run():
         host = 'localhost'
         for p in range(8765, 8776):
             try:
-                server = HTTPServer((host, p), BillbackHandler)
+                server = ThreadedHTTPServer((host, p), BillbackHandler)
                 port = p
                 break
             except OSError:
