@@ -3119,6 +3119,10 @@ def parse_trackmax(filepath, cfg, customer_ref, source_name=''):
             re.I
         )
 
+        from collections import defaultdict
+        totals_qty = defaultdict(float)
+        totals_amt = defaultdict(float)
+
         seen_lines = set()
         for line in all_text.splitlines():
             if re.search(r'^Totals for|^Grand Total|Powered by|Invoice is Due', line, re.I):
@@ -3145,6 +3149,10 @@ def parse_trackmax(filepath, cfg, customer_ref, source_name=''):
 
             amount = clean_amount(raw_amt)  # handles ($9.04) and $-2.80 → negative
 
+            totals_qty[item] += qty
+            totals_amt[item] += amount
+
+        for item in totals_qty:
             rows.append(make_row(
                 source=source_name,
                 program_num=cfg['program_num'],
@@ -3154,8 +3162,8 @@ def parse_trackmax(filepath, cfg, customer_ref, source_name=''):
                 start_date=start_date,
                 end_date=end_date,
                 item=item,
-                qty=qty,
-                amount=amount,
+                qty=round(totals_qty[item], 4),
+                amount=round(totals_amt[item], 2),
                 trade=cfg['trade']
             ))
 
