@@ -2163,7 +2163,7 @@ def parse_sw_pdf(filepath, cfg, customer_ref, source_override=''):
     rows = []
     try:
         with pdfplumber.open(filepath) as pdf:
-            all_text = '\n'.join(page.extract_text() or '' for page in pdf.pages)
+            _chunks=[]; [(_chunks.append(p.extract_text() or ''), (p.flush_cache() if hasattr(p,'flush_cache') else None)) for p in pdf.pages]; all_text='\n'.join(_chunks); del _chunks
         # No full-text dedup here — short lines like "STRAWBERRY Cost" repeat legitimately.
         # Instead we deduplicate at the match level using a seen_matches set below.
 
@@ -2491,7 +2491,7 @@ def parse_kast_po_report(filepath, cfg, customer_ref):
     rows = []
     try:
         with pdfplumber.open(filepath) as pdf:
-            all_text = '\n'.join(page.extract_text() or '' for page in pdf.pages)
+            _chunks=[]; [(_chunks.append(p.extract_text() or ''), (p.flush_cache() if hasattr(p,'flush_cache') else None)) for p in pdf.pages]; all_text='\n'.join(_chunks); del _chunks
 
         # Bill date — first date in the header (report run date)
         bill_date = ''
@@ -3074,8 +3074,16 @@ def parse_trackmax(filepath, cfg, customer_ref, source_name=''):
     """
     rows = []
     try:
+        import gc
+        page_chunks = []
         with pdfplumber.open(filepath) as pdf:
-            all_text = '\n'.join(page.extract_text() or '' for page in pdf.pages)
+            for page in pdf.pages:
+                page_chunks.append(page.extract_text() or '')
+                try: page.flush_cache()
+                except: pass
+        all_text = '\n'.join(page_chunks)
+        del page_chunks
+        gc.collect()
 
         # Auto-detect distributor name from header ("IMPORTANT!\n<Company Name>")
         if not source_name:
@@ -3187,7 +3195,7 @@ def parse_henrys_foods(filepath, cfg, customer_ref):
     rows = []
     try:
         with pdfplumber.open(filepath) as pdf:
-            all_text = '\n'.join(page.extract_text() or '' for page in pdf.pages)
+            _chunks=[]; [(_chunks.append(p.extract_text() or ''), (p.flush_cache() if hasattr(p,'flush_cache') else None)) for p in pdf.pages]; all_text='\n'.join(_chunks); del _chunks
 
         # Dates
         bill_date = start_date = end_date = ''
@@ -3296,7 +3304,7 @@ def parse_delco_foods(filepath, cfg, customer_ref):
     rows = []
     try:
         with pdfplumber.open(filepath) as pdf:
-            all_text = '\n'.join(page.extract_text() or '' for page in pdf.pages)
+            _chunks=[]; [(_chunks.append(p.extract_text() or ''), (p.flush_cache() if hasattr(p,'flush_cache') else None)) for p in pdf.pages]; all_text='\n'.join(_chunks); del _chunks
 
         # Statement / bill date
         bill_date = start_date = end_date = ''
@@ -3397,7 +3405,7 @@ def parse_chefs_warehouse(filepath, cfg, customer_ref):
     rows = []
     try:
         with pdfplumber.open(filepath) as pdf:
-            all_text = '\n'.join(page.extract_text() or '' for page in pdf.pages)
+            _chunks=[]; [(_chunks.append(p.extract_text() or ''), (p.flush_cache() if hasattr(p,'flush_cache') else None)) for p in pdf.pages]; all_text='\n'.join(_chunks); del _chunks
         bill_date = start_date = end_date = ''
         m = re.search(r'generated\s+on\s+(\d{1,2}/\d{1,2}/\d{4})', all_text, re.I)
         if m: bill_date = to_yyyymmdd(m.group(1))
@@ -3853,7 +3861,7 @@ def parse_atlas(filepath, cfg, customer_ref):
     rows = []
     try:
         with pdfplumber.open(filepath) as pdf:
-            all_text = '\n'.join(page.extract_text() or '' for page in pdf.pages)
+            _chunks=[]; [(_chunks.append(p.extract_text() or ''), (p.flush_cache() if hasattr(p,'flush_cache') else None)) for p in pdf.pages]; all_text='\n'.join(_chunks); del _chunks
 
         bill_date = start_date = end_date = ''
         dr = re.search(r'FROM:\s+(\d{1,2}/\d{1,2}/\d{2,4})\s+TO\s+(\d{1,2}/\d{1,2}/\d{2,4})', all_text, re.I)
