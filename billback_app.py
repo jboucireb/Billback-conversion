@@ -3128,8 +3128,11 @@ def parse_trackmax(filepath, cfg, customer_ref, source_name=''):
         )
 
         from collections import defaultdict
-        totals_qty = defaultdict(float)
-        totals_amt = defaultdict(float)
+        # Aggregate positives and negatives SEPARATELY so exclusion rows remain visible
+        pos_qty = defaultdict(float)
+        pos_amt = defaultdict(float)
+        neg_qty = defaultdict(float)
+        neg_amt = defaultdict(float)
 
         seen_lines = set()
         for line in all_text.splitlines():
@@ -3149,7 +3152,7 @@ def parse_trackmax(filepath, cfg, customer_ref, source_name=''):
             raw_qty = m.group(2)
             raw_amt = m.group(3)
 
-            # Parenthesized qty means a return (negative)
+            # Parenthesized qty means a return/exclusion (negative)
             if raw_qty.startswith('('):
                 qty = -float(raw_qty.strip('()'))
             else:
@@ -3157,10 +3160,15 @@ def parse_trackmax(filepath, cfg, customer_ref, source_name=''):
 
             amount = clean_amount(raw_amt)  # handles ($9.04) and $-2.80 → negative
 
-            totals_qty[item] += qty
-            totals_amt[item] += amount
+            if qty < 0 or amount < 0:
+                neg_qty[item] += qty
+                neg_amt[item] += amount
+            else:
+                pos_qty[item] += qty
+                pos_amt[item] += amount
 
-        for item in totals_qty:
+        # Output positive rows first, then negative (exclusion) rows
+        for item in pos_qty:
             rows.append(make_row(
                 source=source_name,
                 program_num=cfg['program_num'],
@@ -3170,8 +3178,22 @@ def parse_trackmax(filepath, cfg, customer_ref, source_name=''):
                 start_date=start_date,
                 end_date=end_date,
                 item=item,
-                qty=round(totals_qty[item], 4),
-                amount=round(totals_amt[item], 2),
+                qty=round(pos_qty[item], 4),
+                amount=round(pos_amt[item], 2),
+                trade=cfg['trade']
+            ))
+        for item in neg_qty:
+            rows.append(make_row(
+                source=source_name,
+                program_num=cfg['program_num'],
+                customer_ref=cref,
+                dist_id=cfg['dist_id'],
+                bill_date=bill_date,
+                start_date=start_date,
+                end_date=end_date,
+                item=item,
+                qty=round(neg_qty[item], 4),
+                amount=round(neg_amt[item], 2),
                 trade=cfg['trade']
             ))
 
