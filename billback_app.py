@@ -3117,7 +3117,7 @@ def parse_trackmax(filepath, cfg, customer_ref, source_name=''):
         #   Fully Excluded (Y.Hata): ...M-FR036F 256271 0110738337060868 (1.00) (12.50) ($31.44) ($31.44) -10.00 % of FOB ($3.14)
         # Also handles: UPCs up to 18 digits; M-codes with hyphen dropped by pdfplumber (e.g. MFR066F)
         line_pat = re.compile(
-            r'([A-Z]-?[A-Z][A-Z0-9]+)\s+\d{4,9}\s+(?:\d{8,18}\s+)?'  # M-code (hyphen optional), DID, UPC optional (up to 18d)
+            r'([A-Z]-?[A-Z][A-Z0-9]+|P\d+)\s+\d{4,9}\s+(?:\d{8,18}\s+)?'  # M-code or P-code (e.g. P240), DID, UPC optional (up to 18d)
             r'(\([\d.]+\)|[\d.]+)\s+'                    # qty: positive or (negative)
             r'[\d,.()]+\s+'                              # weight (ignore, may have comma e.g. 1,268.40)
             r'(?:\(\$[\d,.]+\)|\$[-\d,.]+)\s+'          # Total Charges 1 (ignore, may be negative $-X.XX)
